@@ -1,0 +1,182 @@
+networks:
+  network_default:
+    ipam:
+      driver: default
+      config:
+        - subnet: '177.7.0.0/16'
+
+volumes:
+  postgres_data: 
+
+services:
+  nhp-server:
+    image: opennhp-server
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.server
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    container_name: nhp-server
+    restart: always
+    # The server requests this socket size and warns if the host kernel clamps
+    # it. net.core.rmem_max must be raised on the host, not from Compose.
+    environment:
+      NHP_UDP_RECV_BUFFER_BYTES: "${NHP_UDP_RECV_BUFFER_BYTES:-}"
+    ports:
+      - "62206:62206/udp"
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.9
+    volumes:
+      - ./nhp-server/etc/:/nhp-server/etc/:rw
+      - ./nhp-server/logs/:/nhp-server/logs/:rw
+      - ./nhp-server/templates/:/nhp-server/templates/:rw
+      - ./nhp-server/plugins/example/etc/:/nhp-server/plugins/example/etc/:rw
+
+  # Second nhp-server instance sharing the same ECDH keypair (one logical
+  # cluster identity, two reachable endpoints). Both instances mount the same
+  # ./nhp-server/etc volume — same private key, same peer tables, same
+  # resources. The AC fans NHP_AOL out to both addresses (177.7.0.9 and
+  # 177.7.0.14), so an agent KNK that lands on either server can still find
+  # the AC's ACConn in its local map.
+  nhp-server-2:
+    image: opennhp-server
+    # Declaring the build context (identical to nhp-server's) keeps the two
+    # instances in lock-step: `docker compose up --build` rebuilds the image
+    # once and both containers come up running the same binary. Without
+    # this, nhp-server-2 silently kept whatever image was pulled the first
+    # time the service was created, which means rebuilding nhp-server
+    # alone would split the demo across two different binaries.
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.server
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    container_name: nhp-server-2
+    restart: always
+    environment:
+      NHP_UDP_RECV_BUFFER_BYTES: "${NHP_UDP_RECV_BUFFER_BYTES:-}"
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.14
+    volumes:
+      - ./nhp-server/etc2/:/nhp-server/etc/:rw
+      - ./nhp-server/logs-2/:/nhp-server/logs/:rw
+      - ./nhp-server/templates/:/nhp-server/templates/:rw
+      - ./nhp-server/plugins/example/etc/:/nhp-server/plugins/example/etc/:rw
+    depends_on:
+      - nhp-server
+
+  nhp-ac:
+    image: opennhp-ac
+    container_name: nhp-ac
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.ac
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    volumes:
+      - ./nhp-ac/etc/:/nhp-ac/etc/
+      - ./nhp-ac/traefik/etc/traefik.toml:/opt/traefik/traefik.toml
+      - ./nhp-ac/traefik/etc/provider.toml:/opt/traefik/provider.toml
+      - ./nhp-ac/logs/:/nhp-ac/logs/
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - nhp-server
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.10
+
+  web-app:
+    image: web-app
+    container_name: web-app
+    build:
+      context: .
+      dockerfile: ./Dockerfile.app
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.11
+
+  nhp-relay:
+    image: opennhp-relay
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.relay
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    container_name: nhp-relay
+    restart: always
+    ports:
+      - "8080:8080"
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.12
+    depends_on:
+      - nhp-server
+    volumes:
+      - ./nhp-relay/etc/:/nhp-relay/etc/:rw
+      - ./nhp-relay/logs/:/nhp-relay/logs/:rw
+
+  nhp-agent:
+    image: opennhp-agent:latest
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.agent
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    container_name: nhp-agent
+    restart: always
+    #command: []
+    ports:
+      - "443:443"
+      - "80:80"
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.8
+    depends_on:
+      - nhp-server
+      - nhp-ac
+    volumes:
+      - ./nhp-enter-nginx.conf:/etc/nginx/nginx.conf:rw
+      - ./certs/server.crt:/cert.pem:r
+      - ./certs/server.key:/key.pem:r
+      - ./nhp-agent/etc:/nhp-agent/etc:rw
+      - ./nhp-agent/logs:/nhp-agent/logs:rw
+
+  # OpenNHP integrated demo app: SPA that drives js-agent + relay to
+  # register users' NHP keys with nhp-server and knock on hidden resources.
+  # Independent deployment from nhp-agent; the demo owns user identity.
+  demoapp:
+    image: opennhp-demoapp
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.demoapp
+      args:
+        - GOPROXY=${GOPROXY:-}
+        - APT_MIRROR=${APT_MIRROR:-}
+    container_name: demoapp
+    restart: always
+    ports:
+      - "8081:8081"
+    networks:
+      network_default:
+        ipv4_address: 177.7.0.13
+    depends_on:
+      - nhp-server
+      - nhp-relay
+    volumes:
+      - ./demoapp/etc/:/app/etc/:rw
+      - ./demoapp/data/:/app/data/:rw

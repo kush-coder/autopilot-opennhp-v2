@@ -1,0 +1,19 @@
+# Default owners for everything
+* @OpenNHP/maintainers
+
+# Claude bot for automated code review (REQUEST_CHANGES blocks merge)
+* @claude[bot]
+
+# Core protocol
+/nhp/core/ @OpenNHP/core-team
+/nhp/common/ @OpenNHP/core-team
+
+# Endpoints
+/endpoints/ @OpenNHP/endpoints-team
+
+# Documentation
+/docs/ @OpenNHP/docs-team
+*.md @OpenNHP/docs-team
+
+# CI/CD
+/.github/ @OpenNHP/devops-team

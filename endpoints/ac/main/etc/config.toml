@@ -1,0 +1,61 @@
+# NHP-AC base config
+# field with (-) does not support dynamic update
+
+# ACId (-): specify the id of this AC.
+# PrivateKeyBase64 (-): AC private key. Either a plain base64 key (default)
+#   or a sealed blob (starts with "v1$") produced by:
+#     echo "$KEY" | nhp-acd seal
+#   A sealed key is decrypted at startup with a passphrase supplied out of
+#   band. Prefer NHP_KEY_PASSPHRASE_FILE (a file, mode 0600) over
+#   NHP_KEY_PASSPHRASE: an env var is readable from the process environment,
+#   ends up in unit files and crash dumps, and is inherited by child
+#   processes. The passphrase env vars are consulted only when this value is
+#   a sealed blob, so a plain base64 key is unaffected by a stray
+#   NHP_KEY_PASSPHRASE_FILE left exported on the host.
+# DefaultCipherScheme: 0: curve25519, 1: gmsm.
+# MIGRATION: Values changed in v2.x. If upgrading: old 0(gmsm)->new 1, old 1(curve)->new 0.
+# IpPassMode:
+#  0: (default) immediately pass traffic with the agent source ip,
+#  1: process pre-access to determine actual agent source ip then pass.
+# FilterMode:
+#  0: iptables (default)
+#  1: ebpf xdp (requires Linux kernel >= 5.6 and XDP-capable network interface)
+#  Either way the resource's OpenTime governs *new* TCP connections: a session
+#  opened while the knock was valid keeps running until it goes idle, it is
+#  not cut mid-stream when the window closes. Mode 0 gets that from the
+#  iptables baseline's `-m state --state ESTABLISHED` accept, mode 1 from the
+#  eBPF connection tracking (1h idle window, refreshed by every packet).
+#  In mode 1 a TCP session is tracked from the SYN that the knock admitted
+#  and is cut down to a 60s close window on FIN/RST, and a new SYN is always
+#  re-checked against the knock - re-using a source port does not inherit the
+#  old session's permission.
+#  UDP differs between the modes: mode 1 caps a UDP flow at the time left on
+#  the knock (at most a 120s window, never extended by the peer), so a UDP
+#  session *is* cut when OpenTime runs out. UDP has no handshake to bind the
+#  entry to one exchange, so an extendable window would let a peer that
+#  knocked once hold a 4-tuple open indefinitely. Mode 0, using
+#  nf_conntrack, keeps such a flow up instead.
+# LogLevel: 0: silent, 1: error, 2: info, 3: audit, 4: debug, 5: trace.
+# AuthServiceId (-): id for authentication and authorization service provider this AC belongs to.
+# ResourceIds (-): resource group ids that this AC protects.
+ACId = "testAC-346"
+DefaultIp = "172.16.3.46"
+PrivateKeyBase64 = "6++hr1lJkvbCVBCbTm4OpXusFJI0wmDi/RR3WpTz3tk="
+DefaultCipherScheme = 0
+IpPassMode = 0
+LogLevel = 4
+AuthServiceId = "example"
+ResourceIds = ["demo"]
+FilterMode = 0
+# [Metrics]: optional Prometheus /metrics + JSON /healthz endpoint.
+#   Enabled: off by default. When true, a separate HTTP listener is started.
+#   ListenIp: bind address. Empty defaults to 127.0.0.1 so telemetry is not
+#     reachable off-host; set an explicit IP only if a scraper needs remote
+#     access (put it behind your own firewall / network policy in that case).
+#   ListenPort: TCP port, defaults to 9101 when empty/zero (distinct from the
+#     nhp-server default 9100 so a shared host does not collide).
+#   Note: read once at startup; changing it needs a restart.
+[Metrics]
+Enabled = false
+ListenIp = "127.0.0.1"
+ListenPort = 9101

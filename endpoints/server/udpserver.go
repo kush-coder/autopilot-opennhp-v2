@@ -1,0 +1,2067 @@
+package server
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/etcd"
+
+	ebpflocal "github.com/OpenNHP/opennhp/endpoints/server/ebpf"
+
+	"github.com/OpenNHP/opennhp/nhp/audit"
+	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/OpenNHP/opennhp/nhp/core/verifier"
+	"github.com/OpenNHP/opennhp/nhp/keystore"
+	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
+	"github.com/OpenNHP/opennhp/nhp/utils"
+	"github.com/OpenNHP/opennhp/nhp/version"
+)
+
+var (
+	ExeDirPath string
+)
+
+type UdpServer struct {
+	stats struct {
+		totalRecvBytes uint64
+		totalSendBytes uint64
+	}
+
+	config        *Config
+	httpConfig    *HttpConfig
+	log           *log.Logger
+	listenAddr    *net.UDPAddr
+	listenAddrStr string
+	listenConn    *net.UDPConn
+	localIp       string
+	localMac      string
+
+	device     *core.Device
+	httpServer *HttpServer
+	wg         sync.WaitGroup
+	running    atomic.Bool
+	// healthy gates /healthz: set true just before the metrics endpoint
+	// starts (so a probe in the startup window is not told "stopping") and
+	// false at the top of Stop.
+	healthy atomic.Bool
+
+	// observability: metrics are always collected; metricsServer is the
+	// opt-in /metrics + /healthz listener (nil when disabled).
+	startTime     time.Time
+	metrics       *serverMetrics
+	metricsServer *metricsServer
+
+	// Atomic mirrors of Config bool fields that are read on hot paths
+	// (per-packet handlers, per-connection teardown) while updateBaseConfig
+	// may concurrently write s.config from the file-watch goroutine. Reading
+	// the Config struct directly under no lock is a data race (Go does not
+	// guarantee atomic bool reads). These mirrors are the source of truth
+	// for the runtime check; s.config retains the field for json/etcd round
+	// trips and operator-visible state.
+	allowPrivateRelaySource atomic.Bool
+	forceOverload           atomic.Bool
+
+	// attestationScheme holds the currently-active verifier.Scheme as a
+	// string (verifier.Scheme is a string type, so atomic.Value stores the
+	// underlying string). Read on every DHP knock (AppraiseEvidence) and
+	// written from updateBaseConfig; mirroring it avoids the same race
+	// documented above for allowPrivateRelaySource. Storing the string
+	// directly (rather than the typed alias) keeps atomic.Value happy with
+	// its any-typed slots without needing a wrapper struct.
+	attestationScheme atomic.Value // string
+
+	// xdpActiveMinFrameBytes is the datagram floor the attached XDP program is
+	// enforcing, written into its .rodata at load time. Kept so a later
+	// xdp.toml reload can tell the operator that an edit to NhpMinFrameBytes
+	// needs a restart, instead of silently doing nothing. Zero when no filter
+	// is attached.
+	xdpActiveMinFrameBytes atomic.Int32
+
+	// The [NHP-SCAN] window and Top-N the attached filter was started with;
+	// same purpose as xdpActiveMinFrameBytes, zero when no filter is attached.
+	xdpActiveScanSeconds atomic.Int32
+	xdpActiveScanTopN    atomic.Int32
+
+	// connection and remote transaction management
+
+	remoteConnectionMapMutex sync.Mutex
+	remoteConnectionMap      map[string]*UdpConn // indexed by remote UDP address
+
+	// relayConnCount tracks how many relay-forwarded client connections
+	// each NHP_RLY peer currently has open in remoteConnectionMap. Used
+	// to enforce MaxConnectionsPerRelay in O(1) instead of scanning the
+	// entire connection map under remoteConnectionMapMutex (which is
+	// also held by recvPacketRoutine for every incoming UDP packet).
+	relayConnCountMutex sync.Mutex
+	relayConnCount      map[string]int // indexed by relayAddr.String()
+
+	agentPeerMapMutex sync.Mutex
+	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
+
+	acConnectionMapMutex sync.Mutex
+	acConnectionMap      map[string]*ACConn // ac connection is indexed by remote IP address
+
+	acPeerMapMutex sync.Mutex
+	acPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
+
+	relayPeerMapMutex sync.Mutex
+	relayPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
+
+	dbConnectionMapMutex sync.Mutex
+	dbConnectionMap      map[string]*DBConn // ac connection is indexed by remote IP address
+
+	tokenStore *common.TokenStore[*ACTokenEntry]
+
+	// artReplay rejects an authenticated ART packet seen on an earlier UDP
+	// connection. It is installed as a post-validation core hook in Start.
+	artReplay *artReplayCache
+
+	// relayReplay rejects a captured-and-replayed NHP_RLY envelope.
+	// NHP_RLY packets are exempted from the per-connection monotonic /
+	// 20ms flood gates (see nhp/core.responder.shouldCheckRecvAttack /
+	// shouldCheckFlood) because the relay→server conn is a single
+	// shared UDP socket — those gates only catch one-conn-one-sender
+	// patterns. So replay protection on the RLY path is THIS hook.
+	//
+	// It is intentionally NOT a TTL-keyed set keyed on
+	// (pubkey, txid, sendTime): a relay fan-outs a fresh envelope per
+	// inner-client knock, so each relay contributes traffic linearly
+	// with concurrent clients. A TTL set large enough to cover
+	// realistic relay+agent RPS was either evicting live entries (which
+	// let captured envelopes re-pass dedupe) or filling on demand and
+	// rejecting-on-full (which let one hostile client with a valid
+	// relay's inner traffic fill the cache and break every relay in
+	// the system). See relay_replay_window.go for the sliding-window
+	// replacement that has no global capacity to fill and no
+	// fail-closed mode.
+	//
+	// Field name is kept as `relayReplay` for call-site stability; the
+	// type is what changed.
+	relayReplay *relayReplayWindow
+
+	// block address management
+	blockAddrMapMutex sync.Mutex
+	blockAddrMap      map[string]*BlockAddr // indexed by remote UDP address, need lock for dynamic change
+
+	// relayForwardBlockMap tracks (relay UDP address, real client UDP
+	// address) pairs whose per-client connection was closed by the
+	// relay-aware BlockSignal branch. The relay→server conn itself is
+	// NOT block-listed here — that's the GHSA-674q-j8fh-972c invariant
+	// the relay-aware branch exists to enforce — but without a penalty
+	// for the offending real client, a misbehaving browser would just
+	// land on a fresh per-client conn (LastRemoteSendTime == 0) every
+	// time, getting ~one accepted replay/flood per three it sends. The
+	// per-client block on the relay-forward key gives the same penalty
+	// the direct-UDP path already enjoys (AddBlockAddr on a UDP
+	// address), scoped to "this real client behind this relay only".
+	//
+	// Separate map (not reuse of blockAddrMap): blockAddrMap is keyed
+	// by a single UDPAddr string; the relay-forward key is a
+	// compound "relay|<relayAddr>|<realClientAddr>" that blockAddrMap
+	// has no business knowing about. Sharing the map would either
+	// require every existing IsBlockAddr call to learn the new shape
+	// or push the relay-key awareness into the wire-level block
+	// check, neither of which is desirable.
+	relayForwardBlockMapMutex sync.Mutex
+	relayForwardBlockMap      map[string]time.Time // indexed by relay-forward mapKey, value is expiry
+
+	// rknLimiter gates the cookie-verify ECDH for RKN-under-overload per
+	// source IP. Shared (internally locked) between the direct-UDP receive
+	// loop and the relay-forward handlers. See rknRateLimiter.
+	rknLimiter *rknRateLimiter
+
+	// address association map
+	srcIpAssociatedAddrMapMutex sync.Mutex
+	srcIpAssociatedAddrMap      map[string][]*common.NetAddress // indexed by source ip
+
+	// preset asp-resource-address map
+	authServiceMapMutex sync.Mutex
+	authServiceMap      common.AuthSvcProviderMap // indexed by asp id and then resource id
+
+	// plugin handlers
+	pluginHandlerMapMutex sync.Mutex
+	pluginHandlerMap      map[string]plugins.PluginHandler
+
+	// signals
+	signals struct {
+		stop chan struct{}
+	}
+
+	recvMsgCh <-chan *core.PacketParserData
+	sendMsgCh chan *core.MsgData
+
+	// handlerSem bounds in-flight handler goroutines (see
+	// MaxConcurrentHandlers for rationale). Each KNK/RKN/EXT/RLY/OTP/
+	// REG/LST/DAR/DRG/DAV branch in recvMessageRoutine acquires a slot
+	// before spawning and releases on goroutine exit. A non-blocking
+	// acquire is used so the recv routine itself never stalls — packets
+	// that can't acquire a slot are dropped (the agent will retry).
+	handlerSem chan struct{}
+
+	// keyStore persists agent public keys and OTP records in SQLite.
+	keyStore *AgentKeyStore
+
+	// auditLedger is the tamper-evident security audit ledger. nil when
+	// auditing is disabled (the default). Emission goes through the nil-safe
+	// auditEvent helper, so a bare call is always safe; the handlers still
+	// wrap their whole build-the-fields block in an `if s.auditLedger != nil`
+	// to skip that work entirely when auditing is off.
+	auditLedger *audit.Ledger
+
+	// auditWriteFails counts CONSECUTIVE ledger write failures so a sustained
+	// outage (disk full, file made unwritable) escalates to a rate-limited
+	// Critical instead of scrolling past as a single Error line. Reset to 0 on
+	// the next successful write.
+	auditWriteFails atomic.Uint64
+
+	//NHP-DB
+	dbPeerMapMutex sync.Mutex
+	dbPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
+
+	teeMapMutex sync.Mutex
+	teeMap      map[string]*TeeAttestationReport // indexed by tee's measure
+
+	// etcd client
+	etcdConn                *etcd.EtcdConn
+	remoteConfigUpdateMutex sync.Mutex
+}
+
+type BlockAddr struct {
+	addr       *net.UDPAddr
+	expireTime time.Time
+}
+
+type UdpConn struct {
+	ConnData       *core.ConnectionData
+	isACConnection bool // Immutable. Don't change it after creation. Conn object is also stored in acConnectionMap which is indexed by ACId
+	isDBConnection bool // Immutable. Don't change it after creation. Conn object is also stored in dbConnectionMap which is indexed by DBId
+
+	// mapKey is the exact key under which this conn was inserted into
+	// remoteConnectionMap. For direct UDP clients it equals
+	// ConnData.RemoteAddr.String(); for relay-forwarded clients it is a
+	// compound key "relay|<relayAddr>|<realClientAddr>". connectionRoutine
+	// uses this on teardown so the right entry gets removed.
+	mapKey string
+
+	// replaced is set by HandleRelayForward when it observes this conn
+	// as stale (IsClosed=true) and swaps in a fresh replacement under
+	// the same connKey. The per-relay slot is transferred to the new
+	// conn rather than dec'd and re-inc'd, and connectionRoutine's
+	// teardown reads this flag to know it must NOT dec the counter
+	// (the slot now belongs to the replacement).
+	//
+	// Without this flag, the counter accounting depends on whichever
+	// goroutine deletes the map entry first — a race that lets the
+	// teardown defer and HRF both dec the same slot (or both skip the
+	// dec, depending on the interleaving), drifting relayConnCount
+	// away from the true live-connection count and either tightening
+	// or relaxing MaxConnectionsPerRelay over time.
+	replaced atomic.Bool
+}
+
+type ACConn struct {
+	ConnData       *core.ConnectionData
+	ACPeer         *core.UdpPeer
+	ACCipherScheme int
+	ACId           string
+	ServiceId      string
+	Apps           []string
+}
+
+type DBConn struct {
+	ConnData       *core.ConnectionData
+	DBPeer         *core.UdpPeer
+	DBCipherScheme int
+	DBId           string
+}
+
+type TeeAttestationReport struct {
+	Measure      string `json:"measure"`
+	SerialNumber string `json:"serialNumber"`
+	Verified     bool   `json:"verified"`
+}
+
+type TeeAttestationReports struct {
+	TEEs []*TeeAttestationReport `json:"tees"`
+}
+
+func (c *UdpConn) Close() {
+	c.ConnData.Close()
+}
+
+/*
+dirPath: the path of app or shared library entry point
+logLevel: 0: silent, 1: error, 2: info, 3: debug, 4: verbose
+*/
+// UDP server never actively sends first packet outwards. It only reacts to received packet then sends response.
+func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
+	plugins.ExeDirPath = dirPath
+	ExeDirPath = dirPath
+
+	// init logger
+	s.log = log.NewLogger("NHP-Server", logLevel, filepath.Join(ExeDirPath, "logs"), "server")
+	log.SetGlobalLogger(s.log)
+
+	log.Info("=========================================================")
+	log.Info("=== NHP-Server %s started              ===", version.Version)
+	log.Info("=== REVISION %s ===", version.CommitId)
+	log.Info("=== RELEASE %s                       ===", version.BuildTime)
+	log.Info("=========================================================")
+
+	// load remote config,init etcd client
+	err = s.initRemoteConn()
+	if err == nil && s.etcdConn == nil {
+		// init config
+		err = s.loadBaseConfig()
+	} else {
+		// nhp server base config must be loaded first.
+		err = s.loadRemoteBaseConfig()
+	}
+	if err != nil {
+		return err
+	}
+
+	// Initialize the tamper-evident audit ledger if enabled, BEFORE any
+	// listener binds. By default a failure here is logged but never blocks
+	// startup: refusing to boot the gateway because an audit file can't be
+	// opened would turn a logging problem into an outage, and initAuditLedger
+	// already recovers a corrupt file by quarantining it and starting a fresh
+	// chain. An operator who requires an uninterrupted trail sets [Audit]
+	// FailClosed, which turns any such failure into a hard startup error —
+	// and that has to happen here, before loadHttpConfig() starts the HTTP
+	// knock listener and before the UDP socket is opened, or "fail closed"
+	// would still have served requests in the gap. initAuditLedger depends
+	// only on s.config.Audit and ExeDirPath, both already set.
+	if auditErr := s.initAuditLedger(); auditErr != nil {
+		// A pure [Audit] config mistake (bad base64 / too-short signing key)
+		// is always fatal — running on with no trail because of a typo is
+		// worse than the weak key the check protects against. Only an I/O
+		// failure honors the fail-safe / fail-closed trade-off below.
+		if errors.Is(auditErr, errAuditConfig) {
+			return fmt.Errorf("invalid [Audit] configuration: %w", auditErr)
+		}
+		if s.config != nil && s.config.Audit.FailClosed {
+			return fmt.Errorf("audit ledger unavailable and [Audit] FailClosed is set — refusing to start: %w", auditErr)
+		}
+		log.Critical("audit ledger disabled — failed to open: %v", auditErr)
+	}
+	if s.auditLedger != nil {
+		// Stop() is a no-op until s.running is set, which only happens at
+		// the very end of a successful Start — so an error returned by
+		// anything below this point (a bad listen address, a config load
+		// failure further down, ...) would otherwise leak the ledger's file
+		// handle and, in Async mode, its drain goroutine, with no code path
+		// left that ever closes it. Guarded on the named return `err`, so
+		// this is a no-op on the ordinary success path, where Stop's own
+		// call to closeAuditLedger (on the later, real shutdown) is what
+		// closes it.
+		defer func() {
+			if err != nil {
+				s.closeAuditLedger()
+			}
+		}()
+	}
+
+	var netIP net.IP
+	if len(s.config.ListenIp) > 0 {
+		netIP = net.ParseIP(s.config.ListenIp)
+		if netIP == nil {
+			log.Error("udp listen ip address is incorrect!")
+			return fmt.Errorf("udp listen ip address is incorrect")
+		}
+	} else {
+		netIP = net.IPv4zero // will both listen on ipv4 0.0.0.0:port and ipv6 [::]:port
+	}
+
+	s.listenConn, err = net.ListenUDP("udp", &net.UDPAddr{
+		IP:   netIP,
+		Port: s.config.ListenPort,
+	})
+	if err != nil {
+		log.Error("listen error: %v", err)
+		return fmt.Errorf("listen error %v", err)
+	}
+
+	recvBufferTarget, err := parseUDPRecvBufferSize(os.Getenv(UDPRecvBufferEnvVar))
+	if err != nil {
+		_ = s.listenConn.Close()
+		return err
+	}
+	tuneUDPRecvBuffer(s.listenConn, recvBufferTarget)
+
+	// The XDP ingress filter is attached further down, by loadXdpConfig(), and
+	// only for a host whose etc/xdp.toml asks for it. It cannot be attached
+	// here: it needs the whitelist, the datagram floor and the daemon's own
+	// service ports, none of which are known until the configs below are
+	// loaded — and attaching first would mean a window in which the host
+	// filters with an empty SSH whitelist.
+
+	// retrieve local port
+	laddr := s.listenConn.LocalAddr()
+	s.listenAddr, err = net.ResolveUDPAddr(laddr.Network(), laddr.String())
+	if err != nil {
+		log.Error("resolve local UDPAddr error: %v", err)
+		return fmt.Errorf("resolve UDPAddr error %v", err)
+	}
+	s.listenAddrStr = s.listenAddr.String()
+
+	prk, sealed, err := keystore.ResolvePrivateKeyAuto(s.config.PrivateKeyBase64)
+	if err != nil {
+		log.Error("private key parse error: %v", err)
+		return fmt.Errorf("private key parse error %v", err)
+	}
+	if sealed {
+		log.Info("server private key is sealed; unsealed at startup with the configured passphrase")
+		if path, mode, permissive := keystore.PassphraseFilePermissive(); permissive {
+			log.Warning("passphrase file %s is mode %o — restrict it to 0600", path, mode)
+		}
+	}
+
+	option := &core.DeviceOptions{
+		DisableAgentPeerValidation: s.config.DisableAgentValidation,
+		// Count packets dropped before they become a decrypted message —
+		// the most interesting attack signal for a network-hiding product,
+		// and the one seam the rest of the metrics wiring doesn't see
+		// (everything else is instrumented post-decryption). s.metrics is
+		// assigned below before s.device.Start() launches the packet
+		// routines, and recordDroppedPacket is nil-receiver safe, so the
+		// closure is safe to install here.
+		OnPacketDropped: func(stage string) { s.metrics.recordDroppedPacket(stage) },
+	}
+	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
+	if s.device == nil {
+		log.Critical("failed to create device: %v", err)
+		return fmt.Errorf("failed to create device %v", err)
+	}
+
+	if s.config.ARTReplayCacheEntries < 0 || s.config.ARTReplayCacheEntries > 1_000_000 {
+		return fmt.Errorf("ARTReplayCacheEntries must be between 0 and 1000000")
+	}
+	entries := s.config.ARTReplayCacheEntries
+	if entries == 0 {
+		entries = artReplayCacheSize
+	}
+	s.artReplay = newARTReplayCacheWithParams(entries, artReplayCacheTTL, "ART", time.Now)
+	// relayReplay is a per-relay sliding window (WireGuard/IPsec-
+	// style). It has no global capacity to fill and no eviction
+	// policy, so there is no operator-tunable size. The historical
+	// RelayReplayCacheEntries config field is preserved (a non-zero
+	// value logs a deprecation warning) so existing configurations
+	// keep loading after an upgrade. See relay_replay_window.go.
+	if s.config.RelayReplayCacheEntries > 0 {
+		log.Warning("RelayReplayCacheEntries is no longer used; the per-relay sliding window has a fixed size. " +
+			"Please remove the field from your config.")
+	}
+	s.relayReplay = newRelayReplayWindow()
+	// The dedupe hook is a single core hook; chain the per-type
+	// dedupe functions here so callers don't need to know which message
+	// types each cache guards. Each dedupe function returns nil for
+	// unrelated types, so the chain is short-circuited in practice
+	// (a packet only walks the chain until the first match).
+	s.device.SetRecvReplayDedupe(func(ppd *core.PacketParserData) error {
+		if dedupeErr := s.dedupeRecvART(ppd); dedupeErr != nil {
+			return dedupeErr
+		}
+		return s.dedupeRecvRLY(ppd)
+	})
+
+	// Stateless cookie signing key. In a multi-instance cluster all
+	// nhp-server replicas must share the same value so any of them can
+	// verify a cookie that a sibling minted. When the operator hasn't
+	// configured one we mint a random per-process key — fine for a single
+	// instance, broken for a cluster (the failure is silent: cookies
+	// minted by replica A don't verify on replica B and the agent's RKN
+	// stalls until timeout). Always log which mode we're in.
+	cookieKey, cookieKeyErr := decodeCookieSigningKey(s.config.CookieSigningKeyBase64)
+	if cookieKeyErr != nil {
+		// Malformed (not empty) is an ops mistake — fail fast rather
+		// than silently degrading to a per-process random key. Silent
+		// fallback would let a cluster look healthy while its replicas
+		// each mint cookies a sibling can't verify.
+		log.Critical("invalid CookieSigningKeyBase64 in config: %v", cookieKeyErr)
+		return fmt.Errorf("invalid CookieSigningKeyBase64: %w", cookieKeyErr)
+	}
+	if len(cookieKey) == 0 {
+		cookieKey = make([]byte, 32)
+		if _, readErr := rand.Read(cookieKey); readErr != nil {
+			log.Critical("failed to generate random cookie signing key: %v", readErr)
+			return fmt.Errorf("failed to generate random cookie signing key: %v", readErr)
+		}
+		log.Info("CookieSigningKeyBase64 not set; using a random per-process key (single-instance only — clusters must share an operator-supplied key)")
+	} else {
+		log.Info("CookieSigningKeyBase64 configured; cookies are stateless and shared across the cluster")
+		// Catch operators who copy the docker-compose demo config and
+		// forget to regenerate the shared key. The shipped value is
+		// public (committed to docker/nhp-server/etc/config.toml so
+		// `docker-compose up` works out of the box) — running it in
+		// any environment a real client can reach lets anyone who has
+		// browsed the repo mint cookies the server will accept.
+		// Critical (not Warning) so it surfaces in default journalctl
+		// filters and any oncall log-volume alarms.
+		if s.config.CookieSigningKeyBase64 == shippedDemoCookieSigningKeyBase64 {
+			log.Critical("CookieSigningKeyBase64 matches the docker-compose demo value committed at " +
+				"docker/nhp-server/etc/config.toml — this key is PUBLIC. Regenerate before any " +
+				"deployment reachable from outside the host (use `nhp-serverd keygen --curve` or " +
+				"`openssl rand -base64 32`).")
+		}
+	}
+	cookieWindow := s.config.CookieTimeWindowSeconds
+	if cookieWindow <= 0 {
+		cookieWindow = DefaultCookieTimeWindowSeconds
+	}
+	s.device.SetStatelessCookieParams(cookieKey, cookieWindow)
+
+	// ForceOverload pins device Overload at startup so the cookie path
+	// (KNK → NHP_COK → NHP_RKN) is exercised by every agent, including
+	// on a quiet local demo where remoteConnectionMap never crosses
+	// OverloadConnectionThreshold. This is a debug-only toggle; see
+	// the field docstring on Config.ForceOverload. Don't pair this with
+	// SetOverload(false) in reload — once on, leave it on; the normal
+	// trigger may also be active and we don't want to fight it.
+	s.forceOverload.Store(s.config.ForceOverload)
+	s.allowPrivateRelaySource.Store(s.config.AllowPrivateRelaySource)
+	s.attestationScheme.Store(string(verifier.ResolveScheme(s.config.AttestationScheme)))
+	if s.config.ForceOverload {
+		// Critical (not Warning): each of these flags disables a real
+		// production safeguard, and Warning is filtered out of default
+		// journalctl views — exactly where an operator who left a
+		// debug/relaxed flag on would miss it. Match the demo-cookie
+		// Critical above so all three "you are running with a guard off"
+		// signals share one severity.
+		log.Critical("ForceOverload=true: device Overload pinned ON for the lifetime of this process (debug/test only)")
+		s.device.SetOverload(true)
+	}
+	if s.config.AllowPrivateRelaySource {
+		log.Critical("AllowPrivateRelaySource=true: relay SourceAddr public-routability check is DISABLED — " +
+			"a relay can claim private/loopback/link-local client IPs. Intended for local/test only.")
+	}
+	// Same rationale as ForceOverload / AllowPrivateRelaySource above: the
+	// reload path's Critical only fires after a subsequent edit, so a server
+	// that booted with AttestationScheme = "test" silently accepts
+	// self-asserted evidence on the DHP knock path with nothing in the log.
+	// ResolveScheme here so the startup path and the reload path agree on
+	// what "test" means (case-insensitive, trimmed) before either logs.
+	if verifier.ResolveScheme(s.config.AttestationScheme) == verifier.SchemeTest {
+		log.Critical("AttestationScheme=%q: DHP knock path accepts self-asserted evidence with NO cryptographic assurance — for non-TEE demos only, never on a production-facing host", s.config.AttestationScheme)
+	}
+
+	// retrieve local ip and mac
+	s.localIp = utils.GetLocalOutboundAddress().String()
+	s.localMac = utils.GetMacAddress(s.localIp)
+	// load asp resources and plugins
+	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
+	if s.etcdConn != nil {
+		// load nhp server
+		_ = s.loadRemoteConfig()
+	} else {
+		// load peers
+		_ = s.loadPeers()
+
+		// load http config and turn on http server if needed
+		_ = s.loadHttpConfig()
+
+		// load ip associated addresses
+		_ = s.loadSourceIps()
+
+		_ = s.loadResources()
+	}
+
+	// Load the XDP ingress policy (etc/xdp.toml) and, if it asks for one,
+	// attach the filter. Outside the etcd branch on purpose: etcd does not
+	// carry this file, and an etcd-configured server must reach the same
+	// decision from the same file as any other.
+	//
+	// Deliberately after loadHttpConfig(): the filter drops every listening TCP
+	// service on the host, so whether the HTTP knock listener is running is
+	// part of deciding whether it may attach at all.
+	_ = s.loadXdpConfig(logLevel)
+
+	// Initialize agent key store (SQLite).
+	ks, err := NewAgentKeyStore(s.config.DatabasePath)
+	if err != nil {
+		log.Critical("failed to open agent key store: %v", err)
+		return err
+	}
+	s.keyStore = ks
+
+	s.remoteConnectionMap = make(map[string]*UdpConn)
+	s.relayConnCount = make(map[string]int)
+	s.acConnectionMap = make(map[string]*ACConn)
+	s.dbConnectionMap = make(map[string]*DBConn)
+	s.relayPeerMap = make(map[string]*core.UdpPeer)
+	s.tokenStore = common.NewTokenStore[*ACTokenEntry]()
+	s.blockAddrMap = make(map[string]*BlockAddr)
+	s.relayForwardBlockMap = make(map[string]time.Time)
+	s.rknLimiter = newRknRateLimiter(
+		OverloadRknRatePerSecondPerIP,
+		OverloadRknBurstPerIP,
+		OverloadRknLimiterMaxEntries,
+		OverloadRknLimiterIdleSeconds*int64(time.Second),
+	)
+	s.signals.stop = make(chan struct{})
+
+	s.recvMsgCh = s.device.DecryptedMsgQueue
+	s.sendMsgCh = make(chan *core.MsgData, core.SendQueueSize)
+	s.handlerSem = make(chan struct{}, MaxConcurrentHandlers)
+
+	// observability: always collect metrics; the /metrics + /healthz listener
+	// is opt-in via [Metrics] in config.toml and binds locally by default.
+	s.startTime = time.Now()
+	s.metrics = newServerMetrics(s, s.startTime)
+	if s.config.Metrics.Enabled {
+		s.healthy.Store(true) // /healthz answers "ok" from here until Stop
+		s.metricsServer = newMetricsServer(s)
+		if startErr := s.metricsServer.start(); startErr != nil {
+			log.Error("[Metrics] endpoint failed to start: %v", startErr)
+			s.metricsServer = nil
+		}
+	}
+
+	// Register keystore-backed peer lookup fallback so dynamically
+	// registered agents (via NHP-REG) are accepted even though they
+	// are not in the static agent.toml peer pool.
+	if s.keyStore != nil {
+		opt := s.device.GetOption()
+		opt.PeerLookupFallback = func(pubKey []byte, headerType int) bool {
+			// Agent-initiated packet types a dynamically-registered
+			// agent (not in agent.toml) can legitimately send after a
+			// successful NHP-REG. NHP_OTP / NHP_REG skip peer
+			// validation entirely (see responder.validatePeer), so
+			// they aren't listed here. NHP_LST must be included or a
+			// freshly-registered agent's listServices call is rejected
+			// with "peer not found in peer pool" → relay 504.
+			if headerType != core.NHP_KNK && headerType != core.NHP_LST &&
+				headerType != core.NHP_RKN && headerType != core.NHP_EXT {
+				return false
+			}
+			pk := base64.StdEncoding.EncodeToString(pubKey)
+			found, _ := s.keyStore.FindAgentByPublicKey(pk)
+			return found
+		}
+		s.device.SetOption(opt)
+	}
+
+	// start device routines
+	s.device.Start()
+
+	// start server routines
+	s.wg.Add(5)
+	go s.tokenStore.RunRefreshRoutine(&s.wg, s.signals.stop, TokenStoreRefreshInterval)
+	go s.BlockAddrRefreshRoutine()
+	go s.recvPacketRoutine()
+	go s.sendMessageRoutine()
+	go s.recvMessageRoutine()
+
+	// Sweep expired registered-key rows on a 5-minute cadence. This is
+	// a housekeeping measure only — FindAgentByPublicKey already
+	// filters on expires_at, so an expired key is rejected on the next
+	// knock even without this goroutine.
+	if s.keyStore != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-s.signals.stop:
+					return
+				case <-t.C:
+					if n, err := s.keyStore.SweepExpiredDeactivates(); err != nil {
+						log.Warning("keystore: sweep failed: %v", err)
+					} else if n > 0 {
+						log.Info("keystore: swept %d expired agent key(s)", n)
+					}
+					// Also purge stale OTP rows (used or expired, older
+					// than 24h) so the table doesn't grow unbounded.
+					if n, err := s.keyStore.SweepStaleOTPs(86400); err != nil {
+						log.Warning("keystore: otp sweep failed: %v", err)
+					} else if n > 0 {
+						log.Info("keystore: swept %d stale otp record(s)", n)
+					}
+				}
+			}
+		}()
+	}
+
+	s.running.Store(true)
+	return nil
+}
+
+func (s *UdpServer) Stop() {
+	if !s.running.Load() {
+		// already stopped, do nothing
+		return
+	}
+	s.running.Store(false)
+	s.healthy.Store(false)
+	// stop http server first
+	if s.httpServer != nil {
+		s.httpServer.Stop()
+	}
+	if s.metricsServer != nil {
+		s.metricsServer.stop()
+	}
+	if s.etcdConn != nil {
+		s.etcdConn.Close()
+	}
+	close(s.signals.stop)
+	s.listenConn.Close()
+	s.device.Stop()
+	s.StopConfigWatch()
+	s.wg.Wait()
+	close(s.sendMsgCh)
+	s.ClosePlugins()
+
+	if s.keyStore != nil {
+		s.keyStore.Close()
+	}
+
+	s.closeAuditLedger()
+
+	// Detach XDP and remove the pins. The links die with the process anyway,
+	// but leaving the pins behind makes the next start's LoadAndAssign fail
+	// against a stale map if the object ever changes shape.
+	ebpflocal.CleanupBPFFiles()
+
+	log.Info("==========================")
+	log.Info("=== NHP-Server stopped ===")
+	log.Info("==========================")
+	s.log.Close()
+}
+
+// GetListenPort returns the UDP listening port of the server
+func (s *UdpServer) GetListenPort() int {
+	if s.listenAddr != nil {
+		return s.listenAddr.Port
+	}
+	if s.config != nil {
+		return s.config.ListenPort
+	}
+	return 0
+}
+
+// GetHttpPort returns the HTTP listening port and whether HTTP is enabled
+func (s *UdpServer) GetHttpPort() (int, bool) {
+	if s.httpConfig == nil || !s.httpConfig.EnableHttp {
+		return 0, false
+	}
+	port := s.httpConfig.HttpListenPort
+	if port == 0 {
+		port = s.GetListenPort() // falls back to UDP port
+	}
+	return port, true
+}
+
+// GetHttpTLSStatus returns TLS status as a string
+func (s *UdpServer) GetHttpTLSStatus() string {
+	if s.httpConfig != nil && s.httpConfig.EnableTLS {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func (s *UdpServer) IsRunning() bool {
+	return s.running.Load()
+}
+
+func (s *UdpServer) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err error) {
+	defer func() {
+		atomic.AddUint64(&s.stats.totalSendBytes, uint64(n))
+		atomic.StoreInt64(&conn.ConnData.LastLocalSendTime, time.Now().UnixNano())
+
+		if !pkt.KeepAfterSend {
+			s.device.ReleasePoolPacket(pkt)
+		}
+	}()
+
+	pktType := core.HeaderTypeToString(pkt.HeaderType)
+	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+	log.Evaluate("Send [%s] packet (%s -> %s), %d bytes", pktType, s.listenAddrStr, conn.ConnData.RemoteAddr.String(), len(pkt.Content))
+
+	return s.listenConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
+}
+
+func (s *UdpServer) recvPacketRoutine() {
+	defer s.wg.Done()
+	defer log.Debug("recvPacketRoutine stopped")
+
+	log.Debug("recvPacketRoutine started")
+
+	preCheckThreats := make(map[string]int32)
+
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+
+		default:
+		}
+
+		// allocate a new packet buffer for every read
+		pkt := s.device.AllocatePoolPacket()
+
+		// udp recv, blocking until packet arrives or conn.Close()
+		n, remoteAddr, err := s.listenConn.ReadFromUDP(pkt.Buf[:])
+		if err != nil {
+			s.device.ReleasePoolPacket(pkt)
+			log.Error("Read from UDP error: %v", err)
+			if n == 0 {
+				// listenConn closed
+				return
+			}
+			continue
+		}
+		addrStr := remoteAddr.String()
+
+		// add total recv bytes
+		atomic.AddUint64(&s.stats.totalRecvBytes, uint64(n))
+
+		// check minimal length
+		if n < pkt.MinimalLength() {
+			s.device.ReleasePoolPacket(pkt)
+			s.metrics.recordDroppedPacket("too_short")
+			log.Error("Received UDP packet from %s is too short, discard", addrStr)
+			continue
+		}
+
+		// check if it is from blocked address
+		if s.IsBlockAddr(remoteAddr) {
+			s.device.ReleasePoolPacket(pkt)
+			// Counted so a flood stays visible AFTER the source is
+			// block-listed — otherwise rate(...dropped_total) falls exactly
+			// when an attack escalates past the threat threshold.
+			s.metrics.recordDroppedPacket("blocked")
+			log.Critical("Remote address %s is being blocked at the moment, discard.", addrStr)
+			continue
+		}
+
+		recvTime := time.Now().UnixNano()
+		pkt.Content = pkt.Buf[:n]
+		//log.Trace("receive udp packet (%s -> %s): %+v", addrStr, s.listenAddrStr, pkt.Content)
+
+		typ, _, err := s.device.RecvPrecheck(pkt) // this check also records packet header type
+		msgType := core.HeaderTypeToString(typ)
+		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddrStr, n)
+		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddrStr, n)
+		if err != nil {
+			// threat plus 1
+			preCheckThreats[addrStr]++
+			if preCheckThreats[addrStr] > PreCheckThreatCountBeforeBlock {
+				s.AddBlockAddr(remoteAddr)
+			}
+			s.device.ReleasePoolPacket(pkt)
+			// The outermost drop — malformed magic/version, background scan
+			// traffic. It never reaches the OnPacketDropped hook (that fires
+			// inside packetToMsgRoutine), so record it here.
+			s.metrics.recordDroppedPacket("precheck")
+			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddrStr, err)
+			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddrStr, err)
+			continue
+		}
+		// clear threat
+		delete(preCheckThreats, addrStr)
+
+		// Rate-limit RKN-under-overload per source IP BEFORE the packet
+		// reaches the connection routine (and thus before the cookie-
+		// verify ECDH in responder.checkHMAC). This is the only path that
+		// pays a Noise IK floor per packet ahead of authentication and
+		// ahead of the existing connection-level RecvThreatCount limiter,
+		// so an unauthenticated flood is throttled here at its cheapest
+		// point. Over-limit packets are dropped only — not counted as
+		// threats, not block-listed — so honest agents and shared-NAT
+		// egress IPs degrade to dropped-RKN (which agents retry) rather
+		// than a hard block. recvTime is reused as the monotonic-ish now.
+		if pkt.HeaderType == core.NHP_RKN && s.device.IsOverload() {
+			if !s.rknLimiter.allow(remoteAddr, recvTime) {
+				s.device.ReleasePoolPacket(pkt)
+				s.metrics.recordDroppedPacket("rate_limited")
+				log.Warning("RKN from %s dropped: per-IP rate limit exceeded under overload", addrStr)
+				continue
+			}
+		}
+
+		s.remoteConnectionMapMutex.Lock()
+		conn, found := s.remoteConnectionMap[addrStr]
+		s.remoteConnectionMapMutex.Unlock()
+
+		if found {
+			// existing connection
+			atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, recvTime)
+			conn.ConnData.ForwardInboundPacket(pkt)
+
+		} else {
+			// create new connection if there is room
+			if !s.globalCapAdmits() {
+				log.Critical("Reached maximum concurrent connection, discarding packet from: %s", addrStr)
+				s.device.ReleasePoolPacket(pkt)
+				s.metrics.recordDroppedPacket("conn_limit")
+				continue
+			}
+
+			isACConn := pkt.HeaderType == core.NHP_AOL
+			isDBConn := pkt.HeaderType == core.NHP_DOL
+			conn = &UdpConn{
+				isACConnection: isACConn,
+				isDBConnection: isDBConn,
+				mapKey:         addrStr,
+			}
+			// setup new routine for connection
+			conn.ConnData = &core.ConnectionData{
+				InitTime:          recvTime,
+				LastLocalRecvTime: recvTime, // not in multithreaded yet, directly assign value
+				Device:            s.device,
+				LocalAddr:         s.listenAddr,
+				RemoteAddr:        remoteAddr,
+				// CookieStore omitted: server cookies are now stateless
+				// (HMAC of remote ip:port + time window). The legacy
+				// per-conn store is dead state on the server side.
+				RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+				TimeoutMs:            DefaultAgentConnectionTimeoutMs,
+				SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+				RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
+				BlockSignal:          make(chan struct{}),
+				SetTimeoutSignal:     make(chan struct{}),
+				StopSignal:           make(chan struct{}),
+			}
+
+			if conn.isACConnection {
+				conn.ConnData.TimeoutMs = DefaultACConnectionTimeoutMs
+				log.Debug("Received new ac connection from %s", addrStr)
+			}
+			if conn.isDBConnection {
+				conn.ConnData.TimeoutMs = DefaultDBConnectionTimeoutMs
+				log.Debug("Received new db connection from %s", addrStr)
+			}
+			s.remoteConnectionMapMutex.Lock()
+			s.remoteConnectionMap[addrStr] = conn
+			s.remoteConnectionMapMutex.Unlock()
+
+			conn.ConnData.ForwardInboundPacket(pkt)
+
+			log.Info("Accept new UDP connection from %s to %s", addrStr, s.listenAddrStr)
+
+			// launch connection routine
+			s.wg.Add(1)
+			go s.connectionRoutine(conn)
+		}
+	}
+}
+
+// globalCapAdmits reports whether a new direct UDP connection fits under the
+// global connection-table cap. Overload mode and the hard cap are independent
+// conditions: using an else-if makes the cap unreachable once the lower
+// overload threshold has been crossed.
+func (s *UdpServer) globalCapAdmits() bool {
+	s.remoteConnectionMapMutex.Lock()
+	defer s.remoteConnectionMapMutex.Unlock()
+
+	n := len(s.remoteConnectionMap)
+	if n > OverloadConnectionThreshold {
+		s.device.SetOverload(true)
+	}
+	return n < MaxConcurrentConnection
+}
+
+func (s *UdpServer) connectionRoutine(conn *UdpConn) {
+	addrStr := conn.ConnData.RemoteAddr.String()
+
+	defer s.wg.Done()
+	defer log.Debug("Connection routine: %s stopped", addrStr)
+
+	log.Debug("Connection routine: %s started", addrStr)
+
+	// stop receiving packets and clean up
+	defer func() {
+		// Remove old ac connection record
+		// Note on server side, before an old ac connection times out, the very ac can send new connections (due to restart or deemed connection failure)
+		// and it may come with the same remote ip but a different remote port
+		// so make sure the timeout removal here does not delete newer ac connections
+		if conn.isACConnection {
+			var acToDelete string
+			s.acConnectionMapMutex.Lock()
+			for acId, acConn := range s.acConnectionMap {
+				if acConn.ConnData.Equal(conn.ConnData) {
+					acToDelete = acId
+					break
+				}
+			}
+			delete(s.acConnectionMap, acToDelete)
+			s.acConnectionMapMutex.Unlock()
+		}
+
+		if conn.isDBConnection {
+			var dbToDelete string
+			s.dbConnectionMapMutex.Lock()
+			for dbId, dbConn := range s.dbConnectionMap {
+				if dbConn.ConnData.Equal(conn.ConnData) {
+					dbToDelete = dbId
+					break
+				}
+			}
+			delete(s.dbConnectionMap, dbToDelete)
+			s.dbConnectionMapMutex.Unlock()
+		}
+
+		// remove the udp conn from remoteConnectionMap using the same key
+		// that was used on insert. For direct UDP clients that's addrStr;
+		// for relay-forwarded clients it's the compound "relay|..." key
+		// (see msghandler.HandleRelayForward). Using RemoteAddr.String()
+		// here would leak relay-forwarded entries because RemoteAddr is
+		// just the relay's address.
+		mapKey := conn.mapKey
+		if mapKey == "" {
+			mapKey = addrStr
+		}
+		s.remoteConnectionMapMutex.Lock()
+		// Identity check, not just presence: only this routine's own
+		// entry is ours to delete. Today HRF's stale-replace path is
+		// the only writer that swaps a closed conn for a fresh one
+		// under this mutex, and the only flipper of IsClosed is this
+		// routine itself (so HRF can't run its replace until after
+		// the defer returns) — meaning a stranger entry under our
+		// mapKey is currently unreachable. But the counter-side
+		// teardown already uses an explicit replaced flag to stay
+		// identity-aware (see teardownPerRelayCounter); aligning the
+		// map-side here closes the gap pre-emptively so any future
+		// external close path (admin endpoint, timeout sweeper) can't
+		// orphan a newly-inserted replacement entry by deleting it
+		// out from under HRF.
+		existing, ok := s.remoteConnectionMap[mapKey]
+		stillPresent := ok && existing == conn
+		if stillPresent {
+			delete(s.remoteConnectionMap, mapKey)
+		}
+		// ForceOverload (debug only) keeps Overload pinned ON for the
+		// lifetime of the process, so a quiet local demo can still
+		// exercise the cookie path. Honor it here — without this guard,
+		// the very first connection teardown drops the map size back
+		// below threshold and flips Overload off, defeating the flag.
+		//
+		// CONCURRENCY: this whole len + SetOverload(false) lives
+		// inside remoteConnectionMapMutex (locked at the top of this
+		// deferred block, unlocked immediately after). Every other
+		// SetOverload(true) path — globalCapAdmits and relay admission in
+		// msghandler.HandleRelayForward — also runs under the same mutex
+		// while checking len > threshold, so the three call sites are
+		// serialized and the len() observed here is the post-delete
+		// authoritative size. No TOCTOU window between the size
+		// check and the SetOverload call.
+		if !s.forceOverload.Load() && len(s.remoteConnectionMap) <= OverloadConnectionThreshold {
+			s.device.SetOverload(false)
+		}
+		s.remoteConnectionMapMutex.Unlock()
+
+		s.teardownPerRelayCounter(conn, mapKey, stillPresent)
+
+		conn.Close()
+	}()
+
+	idleTimeout := time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+
+		case _, ok := <-conn.ConnData.SetTimeoutSignal:
+			if !ok {
+				return
+			}
+			if conn.ConnData.TimeoutMs <= 0 {
+				log.Debug("Connection routine closed immediately")
+				return
+			}
+			idleTimeout = time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond
+			idleTimer.Reset(idleTimeout)
+
+		case <-idleTimer.C:
+			// timeout, quit routine
+			log.Debug("Connection routine idle timeout")
+			return
+
+		case _, ok := <-conn.ConnData.BlockSignal:
+			if !ok {
+				return
+			}
+			// For a relay-forwarded connection the inner client's
+			// RecvThreatCount gates fire on this conn, but its
+			// ConnData.RemoteAddr is the RELAY's UDP address — block-listing
+			// it would drop every other client behind that relay, not just
+			// the offending one (GHSA-674q-j8fh-972c). The right action is
+			// to tear down this per-client conn (real-client isolation is
+			// preserved because the relay conn itself is in a separate
+			// remoteConnectionMap entry), and the relay stays reachable so
+			// the next legitimate client's RKN can still be answered.
+			//
+			// BUT a returning () closes the per-client conn and penalizes
+			// nobody — the next HandleRelayForward for the same real
+			// client just lands on a fresh per-client conn with
+			// LastRemoteSendTime == 0 and the replayed or flooded inner
+			// packet is accepted. So: drop the relay-aware branch's
+			// blockAddrMap.AddBlockAddr (would hit the wrong target) and
+			// instead record a relay-scoped, real-client-scoped block on
+			// the connKey. HandleRelayForward checks that map first and
+			// drops forwards for BlockAddrExpireTime, giving the
+			// offending real client the same penalty the direct-UDP path
+			// has — scoped to "this real client behind this relay", not
+			// "every client behind this relay".
+			if conn.ConnData.RealRemoteAddr != nil {
+				mapKey := conn.mapKey
+				if mapKey == "" {
+					// mapKey is empty only when the conn was never
+					// inserted into remoteConnectionMap (e.g. a test
+					// fixture that drives BlockSignal directly without
+					// going through HandleRelayForward). Fall back to
+					// the relay-prefixed composite so the block still
+					// has a stable key.
+					mapKey = relayConnKeyPrefix + conn.ConnData.RemoteAddr.String() + relayConnKeySep + conn.ConnData.RealRemoteAddr.String()
+				}
+				s.AddRelayForwardBlock(mapKey)
+				log.Critical("connection routine closing relay-forwarded client %s (relay %s) after inner threat signal; per-client block on %s, relay address NOT block-listed",
+					conn.ConnData.RealRemoteAddr.String(), conn.ConnData.RemoteAddr.String(), mapKey)
+				return
+			}
+			s.AddBlockAddr(conn.ConnData.RemoteAddr)
+			return
+
+		case pkt, ok := <-conn.ConnData.RecvQueue:
+			if !ok {
+				return
+			}
+			idleTimer.Reset(idleTimeout)
+			if pkt == nil {
+				continue
+			}
+			log.Debug("Received udp packet len [%d] from addr: %s", len(pkt.Content), addrStr)
+
+			// process keepalive packet
+			if pkt.HeaderType == core.NHP_KPL {
+				s.device.ReleasePoolPacket(pkt)
+				log.Info("Receive [NHP_KPL] message (%s -> %s)", addrStr, s.listenAddrStr)
+				continue
+			}
+
+			if s.device.IsTransactionResponse(pkt.HeaderType) {
+				// forward to a specific transaction
+				transactionId := pkt.Counter()
+				transaction := s.device.FindLocalTransaction(transactionId)
+				if transaction != nil {
+					if err := transaction.SendPacket(pkt); err != nil {
+						log.Warning("local transaction %d closed before packet forward: %v", transactionId, err)
+						s.device.ReleasePoolPacket(pkt)
+					}
+					continue
+				}
+			}
+
+			pd := &core.PacketData{
+				BasePacket: pkt,
+				ConnData:   conn.ConnData,
+				InitTime:   atomic.LoadInt64(&conn.ConnData.LastLocalRecvTime),
+			}
+			// generic receive
+			s.device.RecvPacketToMsg(pd)
+
+		case pkt, ok := <-conn.ConnData.SendQueue:
+			if !ok {
+				return
+			}
+			idleTimer.Reset(idleTimeout)
+			if pkt == nil {
+				continue
+			}
+			_, _ = s.SendPacket(pkt, conn)
+		}
+	}
+}
+
+func (s *UdpServer) BlockAddrRefreshRoutine() {
+	defer s.wg.Done()
+	defer log.Info("BlockedAddrRoutine stopped")
+
+	log.Info("BlockedAddrRoutine started")
+
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+
+		case <-time.After(BlockAddrRefreshRate * time.Second):
+			s.RefreshBlockAddr()
+			s.RefreshRelayForwardBlocks()
+		}
+	}
+}
+
+func (s *UdpServer) IsBlockAddr(addr *net.UDPAddr) bool {
+	s.blockAddrMapMutex.Lock()
+	defer s.blockAddrMapMutex.Unlock()
+
+	_, found := s.blockAddrMap[addr.String()]
+	return found
+}
+
+func (s *UdpServer) AddBlockAddr(addr *net.UDPAddr) {
+	s.blockAddrMapMutex.Lock()
+	defer s.blockAddrMapMutex.Unlock()
+
+	addrStr := addr.String()
+	log.Critical("add blocking address %s", addrStr)
+
+	if len(s.blockAddrMap) < MaxConcurrentConnection {
+		// Count only newly blocked sources; re-blocking an address that is
+		// already in the pool just refreshes its expiry and shouldn't inflate
+		// the counter.
+		if _, already := s.blockAddrMap[addrStr]; !already {
+			s.metrics.recordBlockedAddr()
+		}
+		s.blockAddrMap[addrStr] = &BlockAddr{addr, time.Now().Add(BlockAddrExpireTime * time.Second)}
+	} else {
+		log.Warning("block address pool is full")
+	}
+}
+
+func (s *UdpServer) RefreshBlockAddr() {
+	s.blockAddrMapMutex.Lock()
+	defer s.blockAddrMapMutex.Unlock()
+
+	now := time.Now()
+	for k, v := range s.blockAddrMap {
+		if v.expireTime.Before(now) {
+			delete(s.blockAddrMap, k)
+		}
+	}
+}
+
+// IsRelayForwardBlocked reports whether the (relay, real-client) pair
+// identified by connKey is currently block-listed from the relay-forward
+// path. Returns false if connKey is not a relay-forward key (no
+// relayConnKeyPrefix) or the block has expired. Lookups are O(1) and
+// happen on every inbound NHP_RLY packet — keep them cheap and lock
+// contention-free from any other relay path.
+func (s *UdpServer) IsRelayForwardBlocked(connKey string) bool {
+	if !strings.HasPrefix(connKey, relayConnKeyPrefix) {
+		return false
+	}
+	s.relayForwardBlockMapMutex.Lock()
+	defer s.relayForwardBlockMapMutex.Unlock()
+
+	expire, ok := s.relayForwardBlockMap[connKey]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expire) {
+		delete(s.relayForwardBlockMap, connKey)
+		return false
+	}
+	return true
+}
+
+// AddRelayForwardBlock block-lists a (relay, real-client) pair for
+// BlockAddrExpireTime so subsequent HandleRelayForward calls carrying
+// the same mapKey drop the forwarded packet before reaching the
+// connection-table lookup. The relay's outer UDP address is unaffected;
+// only this one real client behind this one relay is penalized —
+// other clients behind the same relay keep their forward path
+// working.
+//
+// Called from connectionRoutine's relay-aware BlockSignal branch,
+// which used to just `return` and leave the offending real client
+// with no penalty. Without this hook the per-client conn is closed
+// but the very next inbound forward from the same real client lands
+// on a fresh per-client conn (LastRemoteSendTime == 0) and the
+// replayed / flooded inner packet is accepted, giving the client
+// ~one accepted replay or flood packet per three it sends.
+//
+// Capacity: relayForwardBlockMap is capped at MaxConcurrentConnection,
+// matching blockAddrMap's cap. The relay supplies the key's real-
+// client segment, and that segment includes the source port the
+// remote client chose freely — each new port is a new key, and a
+// client looping with fresh ports can otherwise drive the map
+// unbounded until the 90 s TTL expires. The per-client conn is
+// already closed by the time AddRelayForwardBlock runs, so neither
+// MaxConcurrentConnection (UDP table) nor MaxConnectionsPerRelay
+// (per-relay conn table) bounds this map; the explicit cap does.
+// A flooding client that exceeds it simply fails to register a new
+// block — its existing block (if any) is refreshed, no further
+// memory is allocated, and the periodic sweep reclaims expired
+// entries so steady state stays bounded.
+//
+// Note on the same port-rotation vector: a client that changes its
+// source port between offense rounds gets a fresh key and a fresh
+// conn, and therefore bypasses the block. That's the same exposure
+// blockAddrMap has (also keyed on addr.String()), so the relay-
+// forward block is the same penalty the direct-UDP path has, not a
+// stronger one. Documented here so a future reader doesn't assume
+// the relay-forward block alone closes the replay/flood vector.
+//
+// Returns true if the pair was newly added (a fresh block — a future
+// recordBlockedAddr-style counter should increment on this), false
+// otherwise (refresh of an existing expiry, the cap was hit for a
+// brand-new key, or the key wasn't a valid
+// "relay|<relayAddr>|<realClientAddr>" composite).
+func (s *UdpServer) AddRelayForwardBlock(connKey string) bool {
+	if !isValidRelayConnKey(connKey) {
+		// Direct-UDP conn keys (and malformed prefixes) don't
+		// belong in the relay-forward block map; the relay-aware
+		// BlockSignal branch is the only caller and is gated on
+		// RealRemoteAddr != nil, so this should be unreachable.
+		// Log and no-op rather than silently corrupt the block map.
+		log.Critical("AddRelayForwardBlock called with non-relay conn key %q", connKey)
+		return false
+	}
+	s.relayForwardBlockMapMutex.Lock()
+	defer s.relayForwardBlockMapMutex.Unlock()
+
+	_, already := s.relayForwardBlockMap[connKey]
+	if !already && len(s.relayForwardBlockMap) >= MaxConcurrentConnection {
+		// Cap reached; the offending client's per-client conn is
+		// already gone and the relay's slot is free, so dropping
+		// the block here just means a brand-new key doesn't get
+		// tracked. The client still can't bring up a fresh conn
+		// from the same (relay, realClient) tuple until the
+		// existing entry expires — and the cap puts a hard bound
+		// on memory growth regardless. Match AddBlockAddr's log
+		// line so operators see one signal style across both
+		// block maps.
+		log.Warning("relay-forward block pool is full")
+		return false
+	}
+	s.relayForwardBlockMap[connKey] = time.Now().Add(BlockAddrExpireTime * time.Second)
+	return !already
+}
+
+// RefreshRelayForwardBlocks drops expired (relay, real-client) block
+// entries. Cheap to run; piggy-backs on BlockAddrRefreshRoutine's tick
+// so there's only one goroutine owning the expiry sweep.
+func (s *UdpServer) RefreshRelayForwardBlocks() {
+	s.relayForwardBlockMapMutex.Lock()
+	defer s.relayForwardBlockMapMutex.Unlock()
+
+	now := time.Now()
+	for k, expire := range s.relayForwardBlockMap {
+		if now.After(expire) {
+			delete(s.relayForwardBlockMap, k)
+		}
+	}
+}
+
+func (s *UdpServer) sendMessageRoutine() {
+	defer s.wg.Done()
+	defer log.Info("sendMessageRoutine stopped")
+
+	log.Info("sendMessageRoutine started")
+
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+
+		case md, ok := <-s.sendMsgCh:
+			if !ok {
+				return
+			}
+			if md.PrevParserData != nil && s.device.IsTransactionResponse(md.HeaderType) {
+				// forward to a specific transaction
+				transaction := md.ConnData.FindRemoteTransaction(md.PrevParserData.SenderTrxId)
+				if transaction != nil {
+					if err := transaction.SendMessage(md); err != nil {
+						log.Warning("remote transaction %d closed before message forward: %v", md.PrevParserData.SenderTrxId, err)
+					}
+					continue
+				}
+			}
+
+			// generic send
+			s.device.SendMsgToPacket(md)
+		}
+	}
+}
+
+// dispatchHandler launches fn in its own goroutine under the
+// handlerSem budget. A non-blocking acquire keeps recvMessageRoutine
+// itself from stalling when the budget is exhausted: the packet is
+// dropped instead, and the agent will retry. This is the cap that
+// prevents a single misbehaving peer from running the process out of
+// memory by flooding handshake-class packets — MaxConcurrentConnection
+// only bounds unique remote addrs in the connection table, not how
+// many in-flight handlers exist for any one of them.
+func (s *UdpServer) dispatchHandler(ppd *core.PacketParserData, fn func(*core.PacketParserData) error) {
+	select {
+	case s.handlerSem <- struct{}{}:
+	default:
+		msgType := core.HeaderTypeToString(ppd.HeaderType)
+		s.metrics.recordHandlerDropped(msgType)
+		log.Warning("handler goroutine budget (%d) exhausted, dropping %s from %s",
+			MaxConcurrentHandlers, msgType, ppd.ConnData.RemoteAddr.String())
+		return
+	}
+	go func(p *core.PacketParserData) {
+		defer func() { <-s.handlerSem }()
+		// Defense-in-depth: a panic in any message handler (e.g. a parsing
+		// bug on attacker-controlled bytes) must degrade to a dropped
+		// request, not tear down the whole server process.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Critical("handler panic recovered for %s from %s: %v",
+					core.HeaderTypeToString(p.HeaderType),
+					p.ConnData.RemoteAddr.String(), r)
+			}
+		}()
+		_ = fn(p)
+	}(ppd)
+}
+
+func (s *UdpServer) recvMessageRoutine() {
+	defer s.wg.Done()
+	defer log.Info("recvMessageRoutine stopped")
+
+	log.Info("recvMessageRoutine started")
+
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+
+		case ppd, ok := <-s.recvMsgCh:
+			if !ok {
+				return
+			}
+			if ppd == nil {
+				// recvMsgCh is closed
+				continue
+			}
+
+			s.metrics.recordMessageReceived(core.HeaderTypeToString(ppd.HeaderType))
+
+			switch ppd.HeaderType {
+			case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
+				// aynchronously process knock messages with ack response
+				s.dispatchHandler(ppd, s.HandleKnockRequest)
+
+			case core.NHP_RLY:
+				s.dispatchHandler(ppd, s.HandleRelayForward)
+
+			case core.NHP_AOL:
+				// synchronously block and deal with NHP_DOL to ensure future ac messages will be correctly processed. Don't use go routine
+				_ = s.HandleACOnline(ppd)
+
+			case core.NHP_DOL:
+				_ = s.HandleDBOnline(ppd)
+
+			case core.NHP_OTP:
+				s.dispatchHandler(ppd, s.HandleOTPRequest)
+
+			case core.NHP_REG:
+				s.dispatchHandler(ppd, s.HandleRegisterRequest)
+
+			case core.NHP_LST:
+				s.dispatchHandler(ppd, s.HandleListRequest)
+			case core.NHP_DAR:
+				s.dispatchHandler(ppd, s.HandleDHPDARMessage)
+			case core.NHP_DRG:
+				s.dispatchHandler(ppd, s.HandleDHPDRGMessage)
+			case core.NHP_DAV:
+				s.dispatchHandler(ppd, s.HandleDHPDAVMessage)
+			}
+
+		}
+	}
+}
+
+func (s *UdpServer) AddAgentPeer(agent *core.UdpPeer) {
+	if agent.DeviceType() == core.NHP_AGENT {
+		s.device.AddPeer(agent)
+		s.agentPeerMapMutex.Lock()
+		s.agentPeerMap[agent.PublicKeyBase64()] = agent
+		s.agentPeerMapMutex.Unlock()
+	}
+}
+
+func (s *UdpServer) UpdateTeePublicKeyAndConsumerEphemeralPublicKey(teePublicKeyBase64 string, consumerEphemeralPublicKeyBase64 string, agentPulicKey []byte) {
+	agentPulicKeyBase64 := base64.StdEncoding.EncodeToString(agentPulicKey)
+
+	if peer, found := s.agentPeerMap[agentPulicKeyBase64]; found {
+		peer.SetTeePublicKeyBase64(teePublicKeyBase64)
+		peer.SetConsumerEphemeralPublicKeyBase64(consumerEphemeralPublicKeyBase64)
+	}
+}
+
+func (s *UdpServer) GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(agentPublicKey []byte) (teePublicKeyBase64 string, consumerEphemeralPublicKeyBase64 string) {
+	agentPulicKeyBase64 := base64.StdEncoding.EncodeToString(agentPublicKey)
+
+	if peer, found := s.agentPeerMap[agentPulicKeyBase64]; found {
+		return peer.TeePublicKeyBase64(), peer.ConsumerEphemeralPublicKeyBase64()
+	}
+	return "", ""
+}
+func (s *UdpServer) AddACPeer(acPeer *core.UdpPeer) {
+	if acPeer.DeviceType() == core.NHP_AC {
+		s.device.AddPeer(acPeer)
+		s.acPeerMapMutex.Lock()
+		s.acPeerMap[acPeer.PublicKeyBase64()] = acPeer
+		s.acPeerMapMutex.Unlock()
+	}
+}
+
+func (s *UdpServer) AddAddressAssociation(srcIp string, addrs []*common.NetAddress) {
+	s.srcIpAssociatedAddrMapMutex.Lock()
+	s.srcIpAssociatedAddrMap[srcIp] = addrs
+	s.srcIpAssociatedAddrMapMutex.Unlock()
+}
+
+func (s *UdpServer) RemoveAddressAssociation(srcIp string) {
+	s.srcIpAssociatedAddrMapMutex.Lock()
+	delete(s.srcIpAssociatedAddrMap, srcIp)
+	s.srcIpAssociatedAddrMapMutex.Unlock()
+}
+
+func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) error {
+	if len(aspData.AuthSvcId) == 0 {
+		return fmt.Errorf("aspId is empty")
+	}
+
+	s.authServiceMapMutex.Lock()
+	s.authServiceMap[aspData.AuthSvcId] = aspData
+	s.authServiceMapMutex.Unlock()
+
+	if len(aspData.PluginPath) > 0 {
+		h := plugins.ReadPluginHandler(aspData.PluginPath)
+		if h != nil {
+			err := s.LoadPlugin(aspData.AuthSvcId, h)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *UdpServer) AddResource(res *common.ResourceData) error {
+	if len(res.AuthServiceId) == 0 || len(res.ResourceId) == 0 {
+		return fmt.Errorf("aspId or resId is empty")
+	}
+
+	s.authServiceMapMutex.Lock()
+	aspData, found := s.authServiceMap[res.AuthServiceId]
+	if !found {
+		s.authServiceMapMutex.Unlock()
+		return fmt.Errorf("aspId not found")
+	}
+	aspData.ResourceGroups[res.ResourceId] = res
+	s.authServiceMapMutex.Unlock()
+
+	return nil
+}
+
+func (s *UdpServer) ValidatePlugin(h plugins.PluginHandler) bool {
+	// placeholder to validate plugin file
+	// err = checkSignature(s.Signature())
+	// if err != nil {
+	//   return false
+	// }
+
+	return true
+}
+
+func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
+	if !s.ValidatePlugin(h) {
+		log.Error("Plugin: %s validation failed", pluginId)
+		return fmt.Errorf("plugin validation failed")
+	}
+
+	s.pluginHandlerMapMutex.Lock()
+	oldHandler, found := s.pluginHandlerMap[pluginId]
+	s.pluginHandlerMapMutex.Unlock()
+	if found {
+		oldHandler.Close()
+	}
+
+	pluginDirPath := filepath.Join(ExeDirPath, "plugins", pluginId)
+	err := h.Init(&plugins.PluginParamsIn{
+		PluginDirPath: &pluginDirPath,
+		Log:           s.log.NewSubLogger("Plugin["+pluginId+"]", log.LogLevelDebug),
+		Hostname:      &s.config.Hostname,
+		LocalIp:       &s.localIp,
+		LocalMac:      &s.localMac,
+	})
+	if err != nil {
+		log.Error("plugin: %s initialization failed, %v", pluginId, err)
+		return err
+	}
+
+	ver := h.Version()
+	info := h.ExportedData()
+	// use info if necessary
+	_ = info
+
+	s.pluginHandlerMapMutex.Lock()
+	s.pluginHandlerMap[pluginId] = h
+	s.pluginHandlerMapMutex.Unlock()
+
+	log.Info("plugin %s loaded successfully to %s", ver, pluginId)
+	return nil
+}
+
+func (s *UdpServer) ClosePlugins() {
+	s.pluginHandlerMapMutex.Lock()
+	defer s.pluginHandlerMapMutex.Unlock()
+
+	for id, handler := range s.pluginHandlerMap {
+		log.Info("closing plugin: %s", id)
+		handler.Close()
+	}
+}
+
+func (s *UdpServer) FindAuthSvcProvider(aspId string) *common.AuthServiceProviderData {
+	s.authServiceMapMutex.Lock()
+	defer s.authServiceMapMutex.Unlock()
+
+	aspData, found := s.authServiceMap[aspId]
+	if found {
+		return aspData
+	}
+
+	return nil
+}
+
+var lastARTReplayWarn atomic.Int64
+
+// dedupeRecvART runs after peer and timestamp authentication but before body
+// decryption. This is the common point for matched and unmatched ART packets,
+// so a replay cannot evade the cache by missing transaction correlation.
+func (s *UdpServer) dedupeRecvART(ppd *core.PacketParserData) error {
+	if ppd.HeaderType != core.NHP_ART {
+		return nil
+	}
+	if l := len(ppd.RemotePubKey); l != core.PublicKeySize && l != core.PublicKeySizeEx {
+		log.Critical("server[dedupeRecvART] invalid peer pubkey length %d for txid=%d (want %d or %d)", l, ppd.SenderTrxId, core.PublicKeySize, core.PublicKeySizeEx)
+		return common.ErrServerMissingPeerPubkey
+	}
+	s.acPeerMapMutex.Lock()
+	peer := s.acPeerMap[base64.StdEncoding.EncodeToString(ppd.RemotePubKey)]
+	s.acPeerMapMutex.Unlock()
+	if peer == nil || peer.DeviceType() != core.NHP_AC {
+		return common.ErrServerMissingPeerPubkey
+	}
+	if !s.artReplay.MarkSeen(ppd.RemotePubKey, ppd.SenderTrxId, ppd.RemoteSendTime) {
+		now := time.Now().UnixNano()
+		last := lastARTReplayWarn.Load()
+		if now-last >= int64(time.Minute) && lastARTReplayWarn.CompareAndSwap(last, now) {
+			log.Warning("server[dedupeRecvART] dropped replayed ART (txid=%d, pubkey=%s, sendTime=%d)", ppd.SenderTrxId, artPubkeyFingerprint(ppd.RemotePubKey), ppd.RemoteSendTime)
+		}
+		return common.ErrServerDuplicateTransaction
+	}
+	return nil
+}
+
+var lastRelayReplayWarn atomic.Int64
+
+// dedupeRecvRLY rejects a captured-and-replayed NHP_RLY envelope. The packet
+// has already passed peer validation, so the decrypted ppd.RemotePubKey is
+// the relay's authenticated static key — a successful lookup in
+// s.relayPeerMap is what makes this hook safe to gate duplicates by
+// (pubkey, txid). For any non-RLY header type this returns nil so the
+// chain continues; any other code path returns ErrServerMissingPeerPubkey
+// and FAILS CLOSED. The fail-closed branch is the load-bearing piece: the
+// monotonic / flood exemption in core.responder skips both gate paths for
+// NHP_RLY, so the relay→server attack surface is this hook alone — leaving
+// the peer-not-registered case as a pass-through would replay-protect
+// nothing.
+//
+// Why this is needed (see relayReplay field comment): NHP_RLY is exempted
+// from the per-connection monotonic and 20ms flood gates in
+// nhp/core.responder, so without this hook a captured UDP datagram can be
+// replayed indefinitely. The relay conn is a single shared UDP socket, and
+// the per-inner-client conn the decoded packet is re-injected on idles out
+// after DefaultAgentConnectionTimeoutMs (30s) — each replay therefore lands
+// on a fresh per-client conn with LastRemoteSendTime == 0 and passes every
+// other gate.
+//
+// The dedupe state itself is a per-relay sliding window (see
+// relay_replay_window.go). Its invariants are: out-of-order distinct txids
+// within the window are all accepted (concurrent-clients fan-out case);
+// the same txid seen twice is rejected; a txid far below the window is
+// rejected regardless of sendTime; a freshly-anchored sendTime from the
+// same relay after a restart resets the window so the new low-txid
+// envelopes are accepted. The signature over RemoteSendTime makes the
+// "attacker bumps sendTime to reset and bypass" path impossible — only
+// the relay's own key produces envelopes that pass validatePeer.
+func (s *UdpServer) dedupeRecvRLY(ppd *core.PacketParserData) error {
+	if ppd.HeaderType != core.NHP_RLY {
+		return nil
+	}
+	if l := len(ppd.RemotePubKey); l != core.PublicKeySize && l != core.PublicKeySizeEx {
+		log.Critical("server[dedupeRecvRLY] invalid peer pubkey length %d for txid=%d (want %d or %d)", l, ppd.SenderTrxId, core.PublicKeySize, core.PublicKeySizeEx)
+		return common.ErrServerMissingPeerPubkey
+	}
+	s.relayPeerMapMutex.Lock()
+	peer := s.relayPeerMap[base64.StdEncoding.EncodeToString(ppd.RemotePubKey)]
+	s.relayPeerMapMutex.Unlock()
+	if peer == nil || peer.DeviceType() != core.NHP_RELAY {
+		// FAIL CLOSED. validatePeer and the dedupe hook key on
+		// different maps (the device peer pool vs relayPeerMap),
+		// and updateRelayPeers used to install a new relay peer
+		// into the device pool before swapping relayPeerMap —
+		// briefly leaving validatePeer accepting an envelope that
+		// the dedupe hook had no record of. That window is closed
+		// by updateRelayPeers now swapping the map before calling
+		// AddPeer, but the dedupe hook still cannot tell the
+		// difference between "registered relay" and "peer pool
+		// just accepted an unrecognized pubkey", so the only safe
+		// answer to "I don't see this peer as a relay" is to
+		// refuse the envelope.
+		return common.ErrServerMissingPeerPubkey
+	}
+	if ok, outcome := s.relayReplay.MarkSeen(ppd.RemotePubKey, ppd.SenderTrxId, ppd.RemoteSendTime); !ok {
+		// bitmap caught a duplicate or an outside-window txid. Both
+		// are "this isn't a fresh envelope", so the dedupe verdict
+		// is the same. The window has no global capacity to fail-
+		// close on, so we never see the "all envelopes rejected"
+		// failure mode here that the previous TTL-set fallback had.
+		now := time.Now().UnixNano()
+		last := lastRelayReplayWarn.Load()
+		if now-last >= int64(time.Minute) && lastRelayReplayWarn.CompareAndSwap(last, now) {
+			log.Warning("server[dedupeRecvRLY] dropped NHP_RLY envelope (txid=%d, pubkey=%s, sendTime=%d, reason=%v)", ppd.SenderTrxId, artPubkeyFingerprint(ppd.RemotePubKey), ppd.RemoteSendTime, outcome)
+		}
+		return common.ErrServerDuplicateTransaction
+	}
+	return nil
+}
+
+func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
+	// should not happen
+	if knkMsg == nil || conn == nil {
+		log.Critical("processACOperation with nil input argument")
+		err = common.ErrInvalidInput
+		return
+	}
+
+	artMsg = &common.ACOpsResultMsg{}
+	if srcAddr == nil || len(dstAddrs) == 0 {
+		log.Error("[processACOperation] no address specified")
+		err = common.ErrACEmptyPassAddress
+		artMsg.ErrCode = common.ErrACEmptyPassAddress.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		// A resource misconfiguration (not an internal "should not happen"),
+		// so it belongs in the error series — but no server→AC round trip
+		// happened, so record the outcome only, not a duration sample.
+		s.metrics.recordACOutcome(false)
+		return
+	}
+
+	srcAddrs := []*common.NetAddress{srcAddr}
+	// check source ip associated address
+	s.srcIpAssociatedAddrMapMutex.Lock()
+	asscAddrs, found := s.srcIpAssociatedAddrMap[srcAddr.Ip]
+	s.srcIpAssociatedAddrMapMutex.Unlock()
+	if found {
+		srcAddrs = append(srcAddrs, asscAddrs...)
+	}
+
+	acAddrStr := conn.ConnData.RemoteAddr.String()
+	if openTime == 0 {
+		openTime = DefaultIpOpenTime
+	}
+
+	aopMsg := &common.ServerACOpsMsg{
+		UserId:           knkMsg.UserId,
+		DeviceId:         knkMsg.DeviceId,
+		OrganizationId:   knkMsg.OrganizationId,
+		AuthServiceId:    knkMsg.AuthServiceId,
+		ResourceId:       knkMsg.ResourceId,
+		SourceAddrs:      srcAddrs,
+		DestinationAddrs: dstAddrs,
+		OpenTime:         openTime + ACOpenCompensationTime, // compensate ac open time
+	}
+	aopBytes, _ := json.Marshal(aopMsg)
+
+	aopMd := &core.MsgData{
+		ConnData:      conn.ConnData,
+		HeaderType:    core.NHP_AOP,
+		CipherScheme:  conn.ACCipherScheme,
+		TransactionId: s.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        conn.ACPeer.PublicKey(),
+		Message:       aopBytes,
+		ResponseMsgCh: make(chan *core.PacketParserData),
+	}
+
+	if !s.IsRunning() {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] MsgData channel closed or being closed, skip sending", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr)
+		err = common.ErrPacketToMessageRoutineStopped
+		artMsg.ErrCode = common.ErrPacketToMessageRoutineStopped.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return
+	}
+
+	// Only now do we actually attempt the server→AC round trip, so arm the
+	// duration/outcome metric here — the early not-running guard above
+	// returned without touching the AC and shouldn't show up as an AC
+	// operation.
+	start := time.Now()
+	defer func() {
+		s.metrics.recordACOperation(err == nil, time.Since(start).Seconds())
+	}()
+
+	s.sendMsgCh <- aopMd
+
+	// wait for ac sending back operation result
+	// block until transaction completes
+	acPpd := <-aopMd.ResponseMsgCh
+	close(aopMd.ResponseMsgCh)
+
+	if acPpd.Error != nil {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] failed to receive response from ac: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, acPpd.Error)
+		err = acPpd.Error
+		artMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return
+	}
+
+	if acPpd.HeaderType != core.NHP_ART {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] response has wrong type: %s", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, core.HeaderTypeToString(acPpd.HeaderType))
+		err = common.ErrTransactionRepliedWithWrongType
+		artMsg.ErrCode = common.ErrTransactionRepliedWithWrongType.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return
+	}
+
+	err = json.Unmarshal(acPpd.BodyMessage, artMsg)
+	if err != nil {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] failed to parse %s message: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, core.HeaderTypeToString(acPpd.HeaderType), err)
+		artMsg.ErrCode = common.ErrJsonParseFailed.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return
+	}
+
+	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] response error: %+v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, artMsg)
+		err = common.ErrACOperationFailed
+		return
+	}
+
+	return artMsg, nil
+}
+
+func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
+	knkMsg := req.Msg
+	srcAddr := req.SrcAddr
+	addrStr := srcAddr.String()
+	ackMsg = req.Ack
+
+	acDstIpMap := make(map[string][]*common.NetAddress)
+	for resName, info := range res.Resources {
+		addrs, exist := acDstIpMap[resName]
+		if exist {
+			addrs = append(addrs, info.Addr)
+			acDstIpMap[resName] = addrs
+		} else {
+			acDstIpMap[resName] = []*common.NetAddress{info.Addr}
+		}
+	}
+
+	// PART III: request ac operation for each resource and block for response
+	var acWg sync.WaitGroup
+	var artMsgsMutex sync.Mutex
+	artMsgs := make(map[string]*common.ACOpsResultMsg)
+	ackMsg.ResourceHost = make(map[string]string)
+	ackMsg.ACTokens = make(map[string]string)
+	ackMsg.PreAccessActions = make(map[string]*common.PreAccessInfo)
+
+	for resName, addrs := range acDstIpMap {
+		resInfo := res.Resources[resName]
+		if resInfo == nil {
+			continue
+		}
+		acId := resInfo.ACId
+		s.acConnectionMapMutex.Lock()
+		acConn, found := s.acConnectionMap[acId]
+		s.acConnectionMapMutex.Unlock()
+		if !found {
+			log.Warning("server-agent(%s@%s)-ac(@%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
+			artMsg := &common.ACOpsResultMsg{}
+			err = common.ErrACConnectionNotFound
+			artMsg.ErrCode = common.ErrACConnectionNotFound.ErrorCode()
+			artMsg.ErrMsg = err.Error()
+			artMsgsMutex.Lock()
+			artMsgs[resName] = artMsg
+			artMsgsMutex.Unlock()
+			continue
+		}
+
+		acWg.Add(1)
+		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
+			defer acWg.Done()
+
+			openTime := res.OpenTime
+			if knkMsg.HeaderType == core.NHP_EXT {
+				openTime = 1 // timeout in 1 second
+			}
+			artMsg, opErr := s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+			artMsgsMutex.Lock()
+			artMsgs[name] = artMsg
+			if opErr == nil {
+				ackMsg.ResourceHost[name] = info.DestHost()
+				ackMsg.ACTokens[name] = artMsg.ACToken
+				ackMsg.PreAccessActions[name] = artMsg.PreAccessAction
+			}
+			artMsgsMutex.Unlock()
+		}(resName, resInfo, addrs)
+	}
+	acWg.Wait()
+
+	var successCount int
+	for _, artMsg := range artMsgs {
+		if artMsg.ErrCode == common.ErrSuccess.ErrorCode() {
+			successCount++
+		}
+	}
+
+	if successCount == 0 {
+		log.Info("server-agent(%s@%s)[handleNhpOpenResource] failed: %+v", knkMsg.UserId, addrStr, artMsgs)
+		err = common.ErrServerACOpsFailed
+		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return
+	}
+
+	ackMsg.ErrCode = common.ErrSuccess.ErrorCode()
+	ackMsg.ErrMsg = common.ErrSuccess.Error()
+	return ackMsg, nil
+}
+
+func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData) *plugins.NhpServerPluginHelper {
+	h := &plugins.NhpServerPluginHelper{}
+	h.StopSignal = ppd.ConnData.StopSignal
+
+	h.AuthWithNhpCallbackFunc = func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+		return us.handleNhpOpenResource(req, res)
+	}
+
+	// Keystore-backed OTP and registration helpers.
+	if us.keyStore != nil {
+		otpTTL := int64(us.config.OTPTTLSeconds)
+		if otpTTL <= 0 {
+			otpTTL = 300 // 5 minutes default
+		}
+		h.OTPTTLSeconds = otpTTL
+
+		// Bind the configured registered-key TTL into RegisterKeyFunc so
+		// the plugin does not have to know about it. Zero in config
+		// means "unset"; fall back to the 24h default.
+		keyTTL := int64(us.config.AgentKeyTTLSeconds)
+		if keyTTL == 0 {
+			keyTTL = DefaultAgentKeyTTLSeconds
+		}
+		h.AgentKeyTTLSeconds = keyTTL
+
+		h.GenerateOTPFunc = func(userId, deviceId, pubKey string, ttlSeconds int64) (string, error) {
+			ttl := time.Duration(ttlSeconds) * time.Second
+			return us.keyStore.GenerateOTP(OTPParams{
+				UserId:    userId,
+				DeviceId:  deviceId,
+				PublicKey: pubKey,
+				TTL:       ttl,
+			})
+		}
+		h.ValidateOTPFunc = us.keyStore.ValidateOTP
+		h.RegisterKeyFunc = func(userId, deviceId, pubKeyBase64 string, cipherScheme int) error {
+			return us.keyStore.RegisterAgentKey(userId, deviceId, pubKeyBase64, cipherScheme, keyTTL)
+		}
+		h.IsRegisteredFunc = us.keyStore.IsAgentRegistered
+		h.GetAgentKeyExpiryFunc = us.keyStore.GetAgentKeyExpiry
+	}
+
+	return h
+}
+
+func (us *UdpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
+	us.pluginHandlerMapMutex.Lock()
+	defer us.pluginHandlerMapMutex.Unlock()
+
+	handler, found := us.pluginHandlerMap[aspId]
+	if !found {
+		return nil
+	}
+	return handler
+}
+
+// DHP
+func (s *UdpServer) AddDEPeer(device *core.UdpPeer) {
+	if device.DeviceType() == core.NHP_DB {
+		s.device.AddPeer(device)
+		s.dbPeerMapMutex.Lock()
+		s.dbPeerMap[device.PublicKeyBase64()] = device
+		s.dbPeerMapMutex.Unlock()
+	}
+}
+
+func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *DBConn) (dwaMsg *common.DWAMsg, err error) {
+	if dwrMsg == nil || conn == nil {
+		log.Critical("processACOperation with nil input argument")
+		err = common.ErrInvalidInput
+		return
+	}
+
+	dbAddrStr := conn.ConnData.RemoteAddr.String()
+
+	dwrBytes, _ := json.Marshal(dwrMsg)
+
+	dwrMd := &core.MsgData{
+		ConnData:      conn.ConnData,
+		HeaderType:    core.NHP_DWR,
+		CipherScheme:  conn.DBCipherScheme,
+		TransactionId: s.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        conn.DBPeer.PublicKey(),
+		Message:       dwrBytes,
+		ResponseMsgCh: make(chan *core.PacketParserData),
+	}
+
+	dwaMsg = &common.DWAMsg{}
+
+	if !s.IsRunning() {
+		log.Error("server-agent-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] MsgData channel closed or being closed, skip sending", conn.DBId, dwrMd.TransactionId, dbAddrStr)
+		err = common.ErrPacketToMessageRoutineStopped
+		errCode, _ := strconv.Atoi(common.ErrPacketToMessageRoutineStopped.ErrorCode())
+		dwaMsg.ErrCode = errCode
+		dwaMsg.ErrMsg = err.Error()
+		return
+	}
+
+	s.sendMsgCh <- dwrMd
+
+	// wait for ac sending back operation result
+	// block until transaction completes
+	dbPpd := <-dwrMd.ResponseMsgCh
+	close(dwrMd.ResponseMsgCh)
+
+	err = json.Unmarshal(dbPpd.BodyMessage, dwaMsg)
+	if err != nil {
+		log.Error("server-agent-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] failed to parse %s message: %v", conn.DBId, dwrMd.TransactionId, dbAddrStr, core.HeaderTypeToString(dbPpd.HeaderType), err)
+		errCode, _ := strconv.Atoi(common.ErrJsonParseFailed.ErrorCode())
+		dwaMsg.ErrCode = errCode
+		dwaMsg.ErrMsg = err.Error()
+		return
+	}
+
+	return dwaMsg, nil
+}

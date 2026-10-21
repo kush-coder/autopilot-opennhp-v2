@@ -1,0 +1,234 @@
+package plugins
+
+import (
+	"fmt"
+	"path/filepath"
+	"plugin"
+
+	"github.com/gin-gonic/gin"
+
+	common "github.com/OpenNHP/opennhp/nhp/common"
+	log "github.com/OpenNHP/opennhp/nhp/log"
+	utils "github.com/OpenNHP/opennhp/nhp/utils"
+)
+
+var ExeDirPath string
+
+type PluginHandler interface {
+	Version() string
+	Signature() string
+	ExportedData() *PluginParamsOut
+	Init(*PluginParamsIn) error
+	Close() error
+	RequestOTP(*common.NhpOTPRequest, *NhpServerPluginHelper) error
+	RegisterAgent(*common.NhpRegisterRequest, *NhpServerPluginHelper) (*common.ServerRegisterAckMsg, error)
+	ListService(*common.NhpListRequest, *NhpServerPluginHelper) (*common.ServerListResultMsg, error)
+	AuthWithNHP(*common.NhpAuthRequest, *NhpServerPluginHelper) (*common.ServerKnockAckMsg, error)
+	AuthWithHttp(*gin.Context, *common.HttpKnockRequest, *HttpServerPluginHelper) (*common.ServerKnockAckMsg, error)
+}
+
+type PluginHandlerSymbol struct {
+	sVersion       plugin.Symbol
+	sSignature     plugin.Symbol
+	sExportedData  plugin.Symbol
+	sInit          plugin.Symbol
+	sClose         plugin.Symbol
+	sRequestOTP    plugin.Symbol
+	sRegisterAgent plugin.Symbol
+	sListService   plugin.Symbol
+	sAuthWithNHP   plugin.Symbol
+	sAuthWithHttp  plugin.Symbol
+}
+
+var errPluginNotImplemented error = fmt.Errorf("plugin not implemented")
+
+func (s *PluginHandlerSymbol) Version() string {
+	if s.sVersion == nil {
+		return ""
+	}
+	defer utils.CatchPanic()
+
+	return s.sVersion.(func() string)()
+}
+
+func (s *PluginHandlerSymbol) Signature() string {
+	if s.sSignature == nil {
+		return ""
+	}
+	defer utils.CatchPanic()
+
+	return s.sSignature.(func() string)()
+}
+
+func (s *PluginHandlerSymbol) ExportedData() *PluginParamsOut {
+	if s.sExportedData == nil {
+		return nil
+	}
+	defer utils.CatchPanic()
+
+	return s.sExportedData.(func() *PluginParamsOut)()
+}
+
+func (s *PluginHandlerSymbol) Init(in *PluginParamsIn) error {
+	if s.sInit == nil {
+		return errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sInit.(func(*PluginParamsIn) error)(in)
+}
+
+func (s *PluginHandlerSymbol) Close() error {
+	if s.sClose == nil {
+		return errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sClose.(func() error)()
+}
+
+func (s *PluginHandlerSymbol) RequestOTP(req *common.NhpOTPRequest, helper *NhpServerPluginHelper) error {
+	if s.sRequestOTP == nil {
+		return errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sRequestOTP.(func(*common.NhpOTPRequest, *NhpServerPluginHelper) error)(req, helper)
+}
+
+func (s *PluginHandlerSymbol) RegisterAgent(req *common.NhpRegisterRequest, helper *NhpServerPluginHelper) (*common.ServerRegisterAckMsg, error) {
+	if s.sRegisterAgent == nil {
+		return nil, errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sRegisterAgent.(func(*common.NhpRegisterRequest, *NhpServerPluginHelper) (*common.ServerRegisterAckMsg, error))(req, helper)
+}
+
+func (s *PluginHandlerSymbol) ListService(req *common.NhpListRequest, helper *NhpServerPluginHelper) (*common.ServerListResultMsg, error) {
+	if s.sListService == nil {
+		return nil, errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sListService.(func(*common.NhpListRequest, *NhpServerPluginHelper) (*common.ServerListResultMsg, error))(req, helper)
+}
+
+func (s *PluginHandlerSymbol) AuthWithNHP(req *common.NhpAuthRequest, helper *NhpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	if s.sAuthWithNHP == nil {
+		log.Error("AuthWithNHP not implemented")
+		return nil, errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sAuthWithNHP.(func(*common.NhpAuthRequest, *NhpServerPluginHelper) (*common.ServerKnockAckMsg, error))(req, helper)
+}
+
+func (s *PluginHandlerSymbol) AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, hlpr *HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	if s.sAuthWithHttp == nil {
+		return nil, errPluginNotImplemented
+	}
+	defer utils.CatchPanic()
+
+	return s.sAuthWithHttp.(func(*gin.Context, *common.HttpKnockRequest, *HttpServerPluginHelper) (*common.ServerKnockAckMsg, error))(ctx, req, hlpr)
+}
+
+func ReadPluginHandler(pluginPath string) PluginHandler {
+	p, err := plugin.Open(filepath.Join(ExeDirPath, "plugins", pluginPath))
+	if err != nil {
+		log.Error("open plugin %s failed: %v", pluginPath, err)
+		return nil
+	}
+	s := &PluginHandlerSymbol{}
+	s.sVersion, _ = p.Lookup("Version")
+	s.sSignature, _ = p.Lookup("Signature")
+	s.sExportedData, _ = p.Lookup("ExportedData")
+	s.sInit, _ = p.Lookup("Init")
+	s.sClose, _ = p.Lookup("Close")
+	s.sRequestOTP, _ = p.Lookup("RequestOTP")
+	s.sRegisterAgent, _ = p.Lookup("RegisterAgent")
+	s.sListService, _ = p.Lookup("ListService")
+	s.sAuthWithNHP, _ = p.Lookup("AuthWithNHP")
+	s.sAuthWithHttp, _ = p.Lookup("AuthWithHttp")
+
+	return s
+}
+
+type PluginParamsIn struct {
+	PluginDirPath *string
+	Log           *log.Logger
+	Hostname      *string
+	LocalIp       *string
+	LocalMac      *string
+}
+
+type PluginParamsOut struct {
+}
+
+type NhpPluginPostAuthFunc func(*common.NhpAuthRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error)
+
+type HttpPluginPostAuthFunc func(*common.HttpKnockRequest, *common.ResourceData) (*common.ServerKnockAckMsg, error)
+
+// Session helper function types for plugin access to HTTP session.
+// These bypass Go plugin type system limitations by using primitive types.
+type SessionGetFunc func(ctx *gin.Context, key string) interface{}
+type SessionSetFunc func(ctx *gin.Context, key string, val interface{})
+type SessionSaveFunc func(ctx *gin.Context) error
+type SessionClearFunc func(ctx *gin.Context)
+
+// OTP and registration helper function types. These allow plugins to
+// interact with the server's AgentKeyStore without directly accessing
+// the database.
+//
+// pubKey is the agent public key carried in the NHP-OTP message. It is
+// bound to the OTP at issuance so that ValidateOTP can reject a
+// registration attempt that presents the same OTP with a different key
+// (stolen-OTP defense). Pass "" when the agent did not supply a key.
+type PluginOTPGenerateFunc func(userId, deviceId, pubKey string, ttlSeconds int64) (otpCode string, err error)
+type PluginOTPValidateFunc func(userId, deviceId, otpCode, pubKey string) error
+
+// PluginRegisterKeyFunc registers an agent public key.
+//
+// BREAKING CHANGE (dual-cipher support): a trailing cipherScheme int
+// parameter was added so the server records which scheme (0 = Curve25519,
+// 1 = GMSM/SM2) the registered key belongs to. Out-of-tree plugins that
+// call helper.RegisterKeyFunc(userId, deviceId, pubKey) MUST update their
+// call site to pass the scheme, e.g.
+// helper.RegisterKeyFunc(userId, deviceId, pubKey, req.CipherScheme).
+type PluginRegisterKeyFunc func(userId, deviceId, pubKeyBase64 string, cipherScheme int) error
+type PluginIsRegisteredFunc func(userId, deviceId string) (bool, error)
+
+// PluginGetAgentKeyExpiryFunc returns whether the user+device has an
+// active registered key, and the unix-seconds timestamp at which it
+// expires (or nil for never-expires). Used by plugins to echo the
+// actual expiry back to the agent without re-deriving it client-side.
+type PluginGetAgentKeyExpiryFunc func(userId, deviceId string) (active bool, expiresAt *int64, err error)
+
+type NhpServerPluginHelper struct {
+	StopSignal              <-chan struct{}
+	AuthWithNhpCallbackFunc NhpPluginPostAuthFunc
+	// OTP and registration helpers — set by server, called by plugin.
+	GenerateOTPFunc       PluginOTPGenerateFunc
+	ValidateOTPFunc       PluginOTPValidateFunc
+	RegisterKeyFunc       PluginRegisterKeyFunc
+	IsRegisteredFunc      PluginIsRegisteredFunc
+	GetAgentKeyExpiryFunc PluginGetAgentKeyExpiryFunc
+	// OTPTTLSeconds is the server-configured OTP lifetime in seconds.
+	// Plugins should read this instead of hardcoding a TTL.
+	OTPTTLSeconds int64
+	// AgentKeyTTLSeconds is the server-configured registered-key
+	// lifetime in seconds. The server binds this into RegisterKeyFunc
+	// so the plugin does not have to know it; plugins can still read
+	// this field to echo "valid for X hours" text in emails etc.
+	AgentKeyTTLSeconds int64
+}
+
+type HttpServerPluginHelper struct {
+	StopSignal               <-chan struct{}
+	AuthWithHttpCallbackFunc HttpPluginPostAuthFunc
+	// Session helper functions - provided by main program
+	SessionGet   SessionGetFunc
+	SessionSet   SessionSetFunc
+	SessionSave  SessionSaveFunc
+	SessionClear SessionClearFunc
+}

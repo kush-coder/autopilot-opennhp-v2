@@ -1,0 +1,178 @@
+package common
+
+import (
+	"strconv"
+	"strings"
+)
+
+var errorMap map[string]*Error = make(map[string]*Error)
+
+var ErrorMsgLanguageLocale string = "EN"
+
+type Error struct {
+	code  string
+	msgEN string
+	msgCH string
+}
+
+// implment NhpError interface
+func (e *Error) Error() string {
+	switch strings.ToUpper(ErrorMsgLanguageLocale) {
+	case "EN", "EN-US", "EN-GB":
+		return e.msgEN
+	case "ZH", "ZH-HANS":
+		return e.msgCH
+	}
+	return ""
+}
+
+func (e *Error) ErrorCode() string {
+	return e.code
+}
+
+func (e *Error) ErrorNumber() int {
+	n, err := strconv.Atoi(e.code)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func newError(code string, enStr string, chStr string) *Error {
+	e := &Error{
+		code:  code,
+		msgEN: enStr,
+		msgCH: chStr,
+	}
+	errorMap[code] = e
+	return e
+}
+
+func ErrorToErrorCode(err error) string {
+	e, ok := err.(*Error)
+	if ok {
+		return e.ErrorCode()
+	}
+	return ""
+}
+
+func ErrorToString(err error) string {
+	e, ok := err.(*Error)
+	if ok {
+		return e.Error()
+	}
+	return ""
+}
+
+func ErrorCodeToError(code string) *Error {
+	e, found := errorMap[code]
+	if found {
+		return e
+	}
+	return nil // should not happen
+}
+
+// ErrorFromResponse maps a protocol response's code to a concrete error. Known
+// NHP codes retain their canonical, localized error. Extension codes emitted by
+// an auth service or AC retain the authenticated response message instead of
+// becoming a nil *Error inside a non-nil error interface.
+func ErrorFromResponse(code, message string) *Error {
+	if e := ErrorCodeToError(code); e != nil {
+		return e
+	}
+	if message == "" {
+		message = "unknown NHP error code " + code
+	}
+	return &Error{code: code, msgEN: message, msgCH: message}
+}
+
+// application errors
+var (
+	// generic
+	ErrSuccess                             = newError("0", "", "")
+	ErrExit                                = newError("1", "must exit", "立即退出")
+	ErrJsonParseFailed                     = newError("50001", "json parse failed", "json解析失败")
+	ErrTransactionIdNotFound               = newError("50002", "transaction id not found", "无法找到交互id")
+	ErrTransactionFailedByTimeout          = newError("50003", "transaction failed due to time out", "请求超时，交互失败")
+	ErrTransactionFailedByClosedConnection = newError("50004", "transaction failed by closed connection", "由于连接中断，交互失败")
+	ErrTransactionFailedByClosedDevice     = newError("50005", "transaction failed by closed device", "由于设备停止，交互失败")
+	ErrTransactionRepliedWithWrongType     = newError("50006", "transaction replied wrong type", "交互回应了错误的消息类型")
+	ErrPacketToMessageRoutineStopped       = newError("50007", "packet to message routine stopped", "消息处理线程已停止")
+	ErrInvalidIpAddress                    = newError("50008", "invalid ip address", "ip地址无效")
+	ErrPacketEncryptionFailed              = newError("50009", "packet encryption failed", "报文加密失败")
+	ErrTransactionClosed                   = newError("50010", "transaction is closed", "交互已关闭")
+
+	// agent
+	ErrKnockUserNotSpecified   = newError("51001", "knock user not specified", "没有指定敲门用户")
+	ErrKnockServerNotFound     = newError("51002", "failed to find knock server", "无法找到敲门服务器")
+	ErrKnockTerminatedByCookie = newError("51003", "knock terminated by cookie", "敲门被cookie包中止")
+
+	// agent: cluster lookup failure modes for KnockResource. These split
+	// the previous "cluster not found" generic failure into the four
+	// distinct mistakes a caller can make on the v1.x cluster ABI, so
+	// SDK consumers can branch on errCode instead of parsing errMsg.
+	// See docs/agent_sdk.md "Migration from v0.x to v1.x".
+	ErrKnockResourceMissingClusterRef    = newError("51004", "knock resource has neither Cluster nor ServerPubKey set", "敲门资源未设置 Cluster 或 ServerPubKey")
+	ErrKnockResourceAmbiguousClusterRef  = newError("51005", "knock resource sets both Cluster and ServerPubKey", "敲门资源同时设置了 Cluster 与 ServerPubKey")
+	ErrKnockResourceUnknownClusterName   = newError("51006", "knock resource references unknown cluster name", "敲门资源引用了未知集群名")
+	ErrKnockResourceUnknownClusterPubKey = newError("51007", "knock resource references unknown ServerPubKey", "敲门资源引用了未注册的 ServerPubKey")
+
+	// agentsdk
+	ErrNoAgentInstance = newError("51100", "agent instance does not exist", "未创建agent实例")
+	ErrInvalidInput    = newError("51101", "invalid input parameter", "无效的输入参数")
+
+	// server
+	ErrKnockApiRequestFailed       = newError("52001", "knock api request failed", "敲门api请求失败")
+	ErrAuthServiceProviderNotFound = newError("52002", "failed to find auth service provider", "无法找到服务提供商")
+	ErrACConnectionNotFound        = newError("52003", "failed to find ac connection", "无法找到门禁连接")
+	ErrResourceNotFound            = newError("52004", "failed to find resource", "无法找到资源")
+	ErrServerACOpsFailed           = newError("52005", "server ac operation failed", "服务器请求门禁操作失败")
+	ErrAuthHandlerNotFound         = newError("52006", "failed to find auth handler", "无法找到验证处理接口")
+	ErrBackendAuthRequired         = newError("52007", "server backend auth required", "服务器需要后端敲门验证")
+	ErrUrlPathInvalid              = newError("52008", "client request url path is invalid", "请求路径无效")
+	// Knock HeaderType verification (on-path header-flip protection). The agent
+	// mirrors the wire HeaderType inside the AEAD-authenticated knock body
+	// (AgentKnockMsg.HeaderType); the server requires the two to match and
+	// rejects otherwise. See endpoints/server/knock_headertype.go.
+	ErrKnockHeaderTypeMismatch    = newError("52009", "knock body header type does not match wire header type", "敲门报文体头部类型与报文头部类型不匹配")
+	ErrKnockHeaderTypeLegacy      = newError("52010", "knock body header type missing, please upgrade agent", "敲门报文体缺少头部类型，请升级agent")
+	ErrServerDuplicateTransaction = newError("52011", "server duplicate transaction (replayed packet)", "服务器重复交互（重放报文）")
+	ErrServerMissingPeerPubkey    = newError("52012", "missing peer pubkey on server transaction", "服务器交互缺少对端公钥")
+
+	// ac
+	ErrACOperationFailed       = newError("53001", "ac operation failed", "门禁操作失败")
+	ErrACEmptyPassAddress      = newError("53002", "pass address is empty", "放行地址为空")
+	ErrACIPSetNotFound         = newError("53003", "ipset not found", "无法找到ipset")
+	ErrACIPSetOperationFailed  = newError("53004", "ipset operation failed", "ipset操作失败")
+	ErrACTempPortListenFailed  = newError("53005", "temporary port listening failed", "临时端口监听失败")
+	ErrACResolveTempPortFailed = newError("53006", "resolve temporary port failed", "解析临时端口失败")
+
+	// api
+	ErrHttpRequestFailed           = newError("54001", "http request failed", "http请求失败")
+	ErrHttpResponseFormatError     = newError("54002", "http response format error", "http响应格式错误")
+	ErrHttpReturnedWithError       = newError("54003", "http returns with error", "http返回带有错误")
+	ErrHttpResourceAddressNotFound = newError("54004", "http resource address not found", "http无法找到资源地址")
+
+	// registration
+	ErrOTPInvalid                   = newError("56001", "otp validation failed", "一次性验证码验证失败")
+	ErrOTPExpired                   = newError("56002", "otp has expired", "一次性验证码已过期")
+	ErrOTPAlreadyUsed               = newError("56003", "otp already used", "一次性验证码已被使用")
+	ErrPublicKeyAlreadyRegistered   = newError("56004", "public key already registered by another user", "公钥已被其他用户注册")
+	ErrAgentAlreadyRegistered       = newError("56005", "agent already registered", "设备已注册")
+	ErrAgentNotRegistered           = newError("56006", "agent not registered", "设备未注册")
+	ErrAgentKeyStoreError           = newError("56007", "agent key store operation failed", "密钥存储操作失败")
+	ErrOTPRateLimited               = newError("56008", "otp rate limited, too many attempts", "一次性验证码尝试次数过多，已锁定")
+	ErrOTPCooldown                  = newError("56009", "otp request too frequent, please wait before requesting a new code", "验证码请求过于频繁，请稍后再试")
+	ErrOTPPublicKeyMismatch         = newError("56010", "otp was issued for a different public key", "一次性验证码绑定的公钥与注册公钥不匹配")
+	ErrRegisterKeyHandshakeMismatch = newError("56011", "public key to register does not match the handshake key", "注册公钥与握手公钥不匹配")
+
+	// db
+	ErrTEENotAuthorized        = newError("55001", "TEE is  not authorized", "可信执行环境未授权")
+	ErrDataPrivateKeyStore     = newError("55002", "data private key store error", "数据私钥存储错误")
+	ErrEvidenceAppraisalFailed = newError("55003", "remote attestation appraisal failed", "远程证明评估失败")
+	ErrEvidenceGetFailed       = newError("55004", "failed to get evidence", "无法获取远程证明")
+	ErrDBOffline               = newError("55005", "data broker offline", "数据经纪件离线")
+)
+
+// ErrInvalidDoID never reflects rejected wire input.
+var ErrInvalidDoID = newError("55006", "invalid data object identifier", "数据对象标识符无效")

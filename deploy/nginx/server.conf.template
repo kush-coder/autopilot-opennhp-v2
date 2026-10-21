@@ -1,0 +1,56 @@
+# RETIRED - NOT DEPLOYED.
+#
+# This vhost used to expose the nhp-server's HTTP demo login page
+# (/plugins/example?action=login&resid=demo) on 443, under
+# auth-plugin.opennhp.org and the legacy alias demologin.opennhp.org.
+#
+# That surface has been closed:
+#   - terraform/demo/security-groups.tf  drops the tcp/443 ingress
+#   - terraform/demo/dns.tf              drops the demologin CNAME
+#   - deploy/config-templates/server/http.toml  sets EnableHttp = false
+#   - deploy-demo-v2.yml "Tear down nginx HTTP/HTTPS surface on server"
+#     removes /etc/nginx/conf.d/server.conf from the host
+#
+# The file is kept for reference only. To restore the login page you must
+# undo all four of the above; re-rendering this template alone does nothing.
+# Note ${LEGACY_DOMAIN_SERVER} was removed from server_name, since
+# demologin.opennhp.org no longer resolves.
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${DOMAIN_SERVER};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN_SERVER}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_SERVER}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location = / {
+        rewrite ^ /plugins/example?action=login&resid=demo break;
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # Replace, do not append: nhp-server's HTTP knock module reads
+        # gin's ctx.ClientIP() which trusts the first XFF entry. The
+        # default $proxy_add_x_forwarded_for would let a remote client
+        # prepend a spoofed IP that flows into the AC ipset rule.
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # Replace, do not append: nhp-server's HTTP knock module reads
+        # gin's ctx.ClientIP() which trusts the first XFF entry. The
+        # default $proxy_add_x_forwarded_for would let a remote client
+        # prepend a spoofed IP that flows into the AC ipset rule.
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}

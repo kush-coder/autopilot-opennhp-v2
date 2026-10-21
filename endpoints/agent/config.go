@@ -1,0 +1,621 @@
+package agent
+
+import (
+	"encoding/base64"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+
+	toml "github.com/pelletier/go-toml/v2"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/OpenNHP/opennhp/nhp/keystore"
+	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/utils"
+)
+
+var (
+	baseConfigWatch     io.Closer
+	dhpConfigWatch      io.Closer
+	serverConfigWatch   io.Closer
+	resourceConfigWatch io.Closer
+
+	errLoadConfig = fmt.Errorf("config load error")
+
+	secretCreated = "/var/run/secret.created"
+)
+
+type Config struct {
+	LogLevel            int    `json:"logLevel"`
+	DefaultCipherScheme int    `json:"defaultCipherScheme"`
+	PrivateKeyBase64    string `json:"privateKey"`
+	KnockUser           `mapstructure:",squash"`
+	*DHPConfig
+
+	// resolvedPrivateKey caches the raw private key after PrivateKeyBase64
+	// has been resolved once at startup (plain base64 or an unsealed blob).
+	// GetAgentEcdh reads it so it does not re-run the unseal KDF on every
+	// call and does not silently mis-handle a sealed key. Populated by the
+	// agent's Start (and refreshed by ReinitWithKey). Unexported, so it is
+	// already skipped by encoding/json and mapstructure — no tag needed.
+	//
+	// Guarded by keyMu: ReinitWithKey rewrites PrivateKeyBase64,
+	// DefaultCipherScheme and resolvedPrivateKey together during a rekey,
+	// while an in-flight /publicKey request may be reading any of the
+	// three (GetAgentEcdh) — none of them may be touched lock-free. Use
+	// SetResolvedPrivateKey / SetPrivateKeyMaterial to write and
+	// GetAgentEcdh's own locking to read, rather than the fields directly.
+	keyMu              sync.RWMutex
+	resolvedPrivateKey []byte
+
+	// sealedMissLogged rate-limits the "sealed key not yet resolved" error to
+	// once per process: the /publicKey handler reaches GetAgentEcdh, so a
+	// client polling it while the cache is (wrongly) empty could otherwise
+	// grow the error log without bound.
+	sealedMissLogged atomic.Bool
+}
+
+// SetResolvedPrivateKey stores the raw private key resolved at startup (or
+// swapped in by a rekey). Safe for concurrent use with GetAgentEcdh.
+func (c *Config) SetResolvedPrivateKey(prk []byte) {
+	c.keyMu.Lock()
+	c.resolvedPrivateKey = prk
+	c.keyMu.Unlock()
+}
+
+// SetPrivateKeyMaterial atomically replaces the base64 config value, cipher
+// scheme, and resolved raw key together. ReinitWithKey rewrites all three
+// on a rekey; setting them one field at a time (as ordinary assignment
+// would) lets a concurrently-running GetAgentEcdh read a torn mix of the
+// old and new key.
+func (c *Config) SetPrivateKeyMaterial(base64Key string, cipherScheme int, raw []byte) {
+	c.keyMu.Lock()
+	c.PrivateKeyBase64 = base64Key
+	c.DefaultCipherScheme = cipherScheme
+	c.resolvedPrivateKey = raw
+	c.keyMu.Unlock()
+}
+
+// SetCipherScheme updates DefaultCipherScheme alone, under keyMu. The
+// config-reload watcher (updateBaseConfig) is the one writer that changes
+// this field outside a full rekey; GetAgentEcdh reads it under the same
+// lock, so an unsynchronized bare assignment here would race a concurrent
+// /publicKey request — go test -race flags exactly that.
+func (c *Config) SetCipherScheme(scheme int) {
+	c.keyMu.Lock()
+	c.DefaultCipherScheme = scheme
+	c.keyMu.Unlock()
+}
+
+// GetCipherScheme reads DefaultCipherScheme under keyMu — the read-side
+// counterpart callers outside Start (single-threaded, so safe to touch the
+// field directly) must use instead of the field, matching SetCipherScheme.
+func (c *Config) GetCipherScheme() int {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.DefaultCipherScheme
+}
+
+// GetPrivateKeyBase64 reads PrivateKeyBase64 under keyMu, matching how
+// SetPrivateKeyMaterial writes it. Prefer this over the field directly from
+// any caller that cannot rule out running concurrently with a rekey.
+func (c *Config) GetPrivateKeyBase64() string {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.PrivateKeyBase64
+}
+
+type DHPConfig struct {
+	TEEPrivateKeyBase64 string `json:"teePrivateKeyBase64"`
+}
+
+func (c *Config) GetAgentEcdh() core.Ecdh {
+	// Read the whole key triple under one lock — DefaultCipherScheme and
+	// PrivateKeyBase64 are rewritten together with resolvedPrivateKey by
+	// ReinitWithKey (see SetPrivateKeyMaterial), and reading them
+	// separately could observe a torn mix of the old and new key.
+	c.keyMu.RLock()
+	cipherScheme := c.DefaultCipherScheme
+	privB64 := c.PrivateKeyBase64
+	prk := c.resolvedPrivateKey
+	c.keyMu.RUnlock()
+
+	eccType := core.ECC_SM2
+	if cipherScheme == common.CIPHER_SCHEME_CURVE {
+		eccType = core.ECC_CURVE25519
+	}
+	// Prefer the key resolved once at startup. If the cache is empty, fall
+	// back to a plain base64 decode ONLY — never re-run keystore resolution
+	// for a sealed key here, which would mean a 64 MiB Argon2id pass inside
+	// an HTTP handler (Start/ReinitWithKey populate the cache before the HTTP
+	// service is up, so the sealed case is unreachable anyway). A sealed key
+	// with an empty cache yields nil, and getAgentPublicKey answers 500.
+	if prk == nil {
+		if keystore.IsSealed(privB64) {
+			if c.sealedMissLogged.CompareAndSwap(false, true) {
+				log.Error("GetAgentEcdh: sealed private key not yet resolved — caller ran before Start (logged once)")
+			}
+		} else {
+			prk, _ = base64.StdEncoding.DecodeString(privB64)
+		}
+	}
+	return core.ECDHFromKey(eccType, prk)
+}
+
+func (c *Config) GetTeeEcdh() core.Ecdh {
+	teePrk, _ := base64.StdEncoding.DecodeString(c.TEEPrivateKeyBase64)
+	return core.ECDHFromKey(c.GetEccType(), teePrk)
+}
+
+// GetEccType reads DefaultCipherScheme under keyMu (see
+// SetPrivateKeyMaterial's doc comment) — this and GetTeeEcdh are reached
+// from goroutines (a gin handler via getTeePublicKey, RefreshDataAccess)
+// that run concurrently with the fsnotify config-reload watcher's
+// SetCipherScheme, same as GetAgentEcdh.
+func (c *Config) GetEccType() core.EccTypeEnum {
+	if c.GetCipherScheme() == common.CIPHER_SCHEME_CURVE {
+		return core.ECC_CURVE25519
+	}
+	return core.ECC_SM2
+}
+
+// Peers is the top-level shape of server.toml. Each entry is one
+// logical nhp-server identity (one pubkey) that may be backed by 1..N
+// physical Instances. See ClusterConfig for both the cluster form and
+// the auto-upgraded legacy flat form.
+type Peers struct {
+	Servers []*ClusterConfig
+}
+
+type Resources struct {
+	Resources []*KnockResource
+}
+
+func (a *UdpAgent) loadBaseConfig() error {
+	// config.toml
+	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
+	if err := a.updateBaseConfig(fileName); err != nil {
+		// report base config error
+		return err
+	}
+
+	baseConfigWatch = utils.WatchFile(fileName, func() {
+		log.Info("base config: %s has been updated", fileName)
+		_ = a.updateBaseConfig(fileName)
+	})
+	return nil
+}
+
+func (a *UdpAgent) loadDHPConfig() error {
+	// dhp.toml
+	fileName := filepath.Join(ExeDirPath, "etc", "dhp.toml")
+	if err := a.updateDHPConfig(fileName); err != nil {
+		// ignore error
+		_ = err
+	}
+
+	dhpConfigWatch = utils.WatchFile(fileName, func() {
+		log.Info("DHP config: %s has been updated", fileName)
+		_ = a.updateDHPConfig(fileName)
+	})
+
+	return nil
+}
+
+func (a *UdpAgent) loadPeers() error {
+	// server.toml
+	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
+	if err := a.updateServerPeers(fileName); err != nil {
+		// ignore error
+		_ = err
+	}
+
+	serverConfigWatch = utils.WatchFile(fileName, func() {
+		log.Info("server peer config: %s has been updated", fileName)
+		_ = a.updateServerPeers(fileName)
+	})
+
+	return nil
+}
+
+func (a *UdpAgent) loadResources() error {
+	// resource.toml
+	fileName := filepath.Join(ExeDirPath, "etc", "resource.toml")
+	if err := a.updateResources(fileName); err != nil {
+		// ignore error
+		_ = err
+	}
+
+	resourceConfigWatch = utils.WatchFile(fileName, func() {
+		log.Info("resource config: %s has been updated", fileName)
+		_ = a.updateResources(fileName)
+	})
+
+	return nil
+}
+
+func (a *UdpAgent) updateBaseConfig(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		if os.IsNotExist(err) && a.allowMissingConfig {
+			// config.toml not yet created (first-time `register` bootstrap);
+			// tolerate it and use an empty config. For run/dhp this branch is
+			// not taken, so a missing config surfaces as an error below.
+			err = nil
+		} else {
+			log.Error("failed to read base config: %v", err)
+		}
+	}
+
+	var conf Config
+	if unmarshalErr := toml.Unmarshal(content, &conf); unmarshalErr != nil {
+		log.Error("failed to unmarshal base config: %v", unmarshalErr)
+	}
+
+	a.knockUserMutex.Lock()
+	a.knockUser = &KnockUser{
+		UserId:         conf.UserId,
+		OrganizationId: conf.OrganizationId,
+		UserData:       conf.UserData,
+	}
+	a.knockUserMutex.Unlock()
+
+	if a.config == nil {
+		a.config = &conf
+		a.log.SetLogLevel(conf.LogLevel)
+		return err
+	}
+
+	// update
+	if a.config.LogLevel != conf.LogLevel {
+		log.Info("set base log level to %d", conf.LogLevel)
+		a.log.SetLogLevel(conf.LogLevel)
+		a.config.LogLevel = conf.LogLevel
+	}
+
+	if a.config.GetCipherScheme() != conf.DefaultCipherScheme {
+		log.Info("set default cipher scheme to %d", conf.DefaultCipherScheme)
+		// GetAgentEcdh reads DefaultCipherScheme under keyMu (see
+		// SetPrivateKeyMaterial's doc comment); this watcher goroutine must
+		// write it under the same lock, not as a bare assignment.
+		a.config.SetCipherScheme(conf.DefaultCipherScheme)
+	}
+
+	return err
+}
+
+func (a *UdpAgent) updateDHPConfig(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Error("failed to read DHP config: %v", err)
+	}
+
+	var conf DHPConfig
+	if unmarshalErr := toml.Unmarshal(content, &conf); unmarshalErr != nil {
+		log.Error("failed to unmarshal DHP config: %v", unmarshalErr)
+	}
+
+	if a.config.DHPConfig == nil {
+		a.config.DHPConfig = &conf
+		return err
+	}
+
+	return err
+}
+
+func (a *UdpAgent) updateServerPeers(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Error("failed to read server peer config: %v", err)
+		return err
+	}
+
+	var peers Peers
+	if unmarshalErr := toml.Unmarshal(content, &peers); unmarshalErr != nil {
+		log.Error("failed to unmarshal server config: %v", unmarshalErr)
+		return unmarshalErr
+	}
+	// Validate + auto-upgrade legacy flat form to cluster form.
+	// Deprecation warnings go through log.Warning so operators see
+	// them in the running daemon's logs, not just at first load.
+	if normErr := normalizeClusters(peers.Servers, log.Warning); normErr != nil {
+		log.Error("invalid server.toml: %v", normErr)
+		return normErr
+	}
+
+	newMap := make(map[string]*ServerCluster, len(peers.Servers))
+	newByName := make(map[string]*ServerCluster, len(peers.Servers))
+	for _, cfg := range peers.Servers {
+		sc, berr := buildCluster(cfg)
+		if berr != nil {
+			log.Error("buildCluster for %s failed: %v", cfg.PubKeyBase64, berr)
+			return berr
+		}
+		a.device.AddPeer(sc.representativePeer)
+		newMap[sc.PublicKeyBase64] = sc
+		newByName[sc.Name] = sc
+	}
+
+	// Swap atomically, then drop peers from device that no longer
+	// appear in the new config. Removal-after-swap avoids a brief
+	// window where an inbound packet could be matched against a
+	// freshly-removed peer that's still in serverClusterMap (or
+	// vice versa).
+	a.serverPeerMutex.Lock()
+	old := a.serverClusterMap
+	a.serverClusterMap = newMap
+	a.serverClusterByName = newByName
+	a.serverPeerMutex.Unlock()
+
+	for pubKey := range old {
+		if _, found := newMap[pubKey]; !found {
+			a.device.RemovePeer(pubKey)
+		}
+	}
+
+	// Re-bind any in-flight KnockTargets onto the freshly-loaded
+	// clusters. Without this, a server.toml-only reload leaves each
+	// KnockTarget holding a stale *ServerCluster (no longer reachable
+	// from serverClusterMap) and a stale *UdpPeer (already removed
+	// from device.peerMap above), and the next handshake fails the
+	// device pubkey lookup. PickInstance's "instance survived the
+	// reload" guard only catches in-cluster shrinkage; it cannot
+	// detect that the entire cluster object was replaced. On a fresh
+	// agent startup loadPeers runs before loadResources, so
+	// knockTargetMap is still nil — skip in that case.
+	a.refreshKnockTargetClusters()
+
+	return err
+}
+
+// refreshKnockTargetClusters re-resolves every KnockTarget's cluster
+// pointer after a server.toml reload and signals the knock-cycle
+// goroutine to restart its sub-routines so they observe the new
+// state. Targets whose Cluster / ServerPubKey reference no longer
+// resolves are removed from knockTargetMap so the knock loop won't
+// keep retrying against vanished servers.
+func (a *UdpAgent) refreshKnockTargetClusters() {
+	a.knockTargetMapMutex.Lock()
+	if a.knockTargetMap == nil {
+		a.knockTargetMapMutex.Unlock()
+		return
+	}
+	// Take a snapshot of the targets we need to revisit; release the
+	// map mutex before calling FindServerClusterFromResource because
+	// that helper takes serverPeerMutex and we want to keep these
+	// locks independent.
+	type pending struct {
+		id     string
+		target *KnockTarget
+	}
+	snapshot := make([]pending, 0, len(a.knockTargetMap))
+	for id, tgt := range a.knockTargetMap {
+		snapshot = append(snapshot, pending{id: id, target: tgt})
+	}
+	a.knockTargetMapMutex.Unlock()
+
+	type removal struct{ id string }
+	var toRemove []removal
+	for _, p := range snapshot {
+		res := &p.target.KnockResource
+		sc, ferr := a.FindServerClusterFromResource(res)
+		if sc == nil {
+			log.Error("server.toml reload removed cluster for resource %s: %v", p.id, ferr)
+			toRemove = append(toRemove, removal{id: p.id})
+			continue
+		}
+		// SetServerCluster resets the sticky pin when the cluster
+		// pointer changes, which is exactly what we want here even
+		// when the cluster name is the same — every *ServerCluster
+		// and its instances were replaced by the swap above.
+		p.target.SetServerCluster(sc)
+		p.target.SetServerPeer(sc.representativePeer)
+	}
+
+	if len(toRemove) > 0 {
+		a.knockTargetMapMutex.Lock()
+		for _, r := range toRemove {
+			delete(a.knockTargetMap, r.id)
+		}
+		a.knockTargetMapMutex.Unlock()
+	}
+
+	// Wake knockResourceRoutine so it tears down its per-target
+	// sub-routines and restarts them with the refreshed map. Without
+	// this, sub-routines that captured the *KnockTarget keep using
+	// the stale chosenInstance until their next natural cycle, and
+	// removed entries continue to be knocked from old sub-routines.
+	// The signal channel is buffered (size 1); a non-blocking send
+	// preserves the existing coalescing semantics — if a previous
+	// update is already queued, this one folds into it.
+	select {
+	case a.signals.knockTargetMapUpdated <- struct{}{}:
+	default:
+	}
+}
+
+func (a *UdpAgent) updateResources(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Error("failed to read resource config: %v", err)
+	}
+
+	var resources Resources
+	targetMap := make(map[string]*KnockTarget)
+	if unmarshalErr := toml.Unmarshal(content, &resources); unmarshalErr != nil {
+		log.Error("failed to unmarshal resource config: %v", unmarshalErr)
+	}
+	for _, res := range resources.Resources {
+		sc, findErr := a.FindServerClusterFromResource(res)
+		if sc == nil {
+			// findErr is already specific (the function logs the
+			// failure mode); skip this entry and move on so a
+			// single bad resource doesn't block the rest.
+			log.Error("skipping resource %s: %v", res.Id(), findErr)
+			continue
+		}
+		targetMap[res.Id()] = &KnockTarget{
+			KnockResource: *res,
+			ServerPeer:    sc.representativePeer,
+			ServerCluster: sc,
+		}
+	}
+
+	if a.knockTargetMap == nil {
+		a.knockTargetMap = targetMap
+		return err
+	}
+
+	// update
+	a.knockTargetMapMutex.Lock()
+	a.knockTargetMap = targetMap
+	a.knockTargetMapMutex.Unlock()
+
+	// renew knock cycle. Non-blocking send (matches
+	// refreshKnockTargetClusters): a debounced file-watcher callback can
+	// fire after Stop(), and the previous blocking send guarded only by
+	// a len()==0 check both raced (two watchers could both observe 0 and
+	// the second would block) and risked blocking forever once the
+	// consumer routine had exited. The non-blocking select coalesces
+	// duplicate updates into the size-1 buffer and never blocks.
+	// knockTargetMapUpdated is intentionally never closed (see Stop()),
+	// so a late send after shutdown lands in the buffer rather than
+	// panicking.
+	select {
+	case a.signals.knockTargetMapUpdated <- struct{}{}:
+	default:
+	}
+
+	return err
+}
+
+func (a *UdpAgent) StopConfigWatch() {
+	if baseConfigWatch != nil {
+		baseConfigWatch.Close()
+	}
+	if dhpConfigWatch != nil {
+		dhpConfigWatch.Close()
+	}
+	if serverConfigWatch != nil {
+		serverConfigWatch.Close()
+	}
+	if resourceConfigWatch != nil {
+		resourceConfigWatch.Close()
+	}
+}
+
+// NewEcdhFromConfigFile reads and parses etc/config.toml, returning both a
+// fresh ECDH keypair derived from its cipher scheme and the parsed Config
+// itself — RotateAgentKey needs the latter to check whether the current key
+// is sealed, and returning it here keeps that from re-reading and
+// re-unmarshaling the same file NewEcdhFromConfigFile just read.
+func (a *UdpAgent) NewEcdhFromConfigFile() (core.Ecdh, *Config, error) {
+	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
+
+	content, err := os.ReadFile(fileName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var conf Config
+	if err := toml.Unmarshal(content, &conf); err != nil {
+		return nil, nil, err
+	}
+
+	return core.NewECDH(conf.GetEccType()), &conf, nil
+}
+
+// RotateTeeKey rewrites TEEPrivateKeyBase64 in dhp.toml. The TEE key is
+// intentionally out of scope for encryption-at-rest (`seal`): it is always
+// written and read as plain base64, unlike the agent's own PrivateKeyBase64.
+func (a *UdpAgent) RotateTeeKey() error {
+	fileName := filepath.Join(ExeDirPath, "etc", "dhp.toml")
+
+	ecdh, _, err := a.NewEcdhFromConfigFile()
+	if err != nil {
+		return err
+	}
+
+	if err := utils.UpdateTomlConfig(fileName, "TEEPrivateKeyBase64", ecdh.PrivateKeyBase64()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *UdpAgent) RotateAgentKey() error {
+	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
+
+	ecdh, conf, err := a.NewEcdhFromConfigFile()
+	if err != nil {
+		return err
+	}
+
+	// Preserve encryption-at-rest across rotation. If the current key is a
+	// sealed blob, the replacement must be sealed too — writing a plain
+	// base64 key here would silently disable the very protection the operator
+	// opted into (and land a readable key on disk). A sealed key without a
+	// usable passphrase is a hard error, never a downgrade.
+	value := ecdh.PrivateKeyBase64()
+	if keystore.IsSealed(conf.PrivateKeyBase64) {
+		pass, passErr := keystore.PassphraseFromEnv()
+		if passErr != nil {
+			return fmt.Errorf("cannot rotate a sealed agent key: %w", passErr)
+		}
+		if len(pass) == 0 {
+			return fmt.Errorf("cannot rotate a sealed agent key: no passphrase configured (set %s or %s)",
+				keystore.EnvPassphrase, keystore.EnvPassphraseFile)
+		}
+		sealed, sealErr := keystore.Seal(ecdh.PrivateKey(), pass)
+		if sealErr != nil {
+			return fmt.Errorf("re-seal rotated agent key: %w", sealErr)
+		}
+		value = sealed
+	}
+
+	if err := utils.UpdateTomlConfig(fileName, "PrivateKeyBase64", value); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *UdpAgent) InitializeSecret() error {
+	if _, err := os.Stat(secretCreated); os.IsNotExist(err) {
+		err := a.RotateAgentKey()
+		if err != nil {
+			return err
+		}
+		err = a.RotateTeeKey()
+		if err != nil {
+			return err
+		}
+
+		_, err = os.Create(secretCreated)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

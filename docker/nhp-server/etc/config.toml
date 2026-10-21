@@ -1,0 +1,129 @@
+# NHP-Server base config
+# field with (-) does not support dynamic update
+
+# PrivateKeyBase64 (-): server private key in base64 format.
+# DefaultCipherScheme: 0: curve25519, 1: gmsm.
+# MIGRATION: Values changed in v2.x. If upgrading: old 0(gmsm)->new 1, old 1(curve)->new 0.
+# ListenIp (-): udp listening address.
+# ListenPort (-): udp listening port.
+# Hostname (-): server domain name.
+# LogLevel: 0: silent, 1: error, 2: info, 3: audit, 4: debug, 5: trace.
+# DisableAgentValidation: whether for the server to skip the agent's public key validation.
+PrivateKeyBase64 = "I9UzYO3skKYmDykz9DRBbV+cEebSw/L5yIvzHI4jz+o="
+DefaultCipherScheme = 1
+ListenIp = "0.0.0.0"    # empty for ipv4 + ipv6, "0.0.0.0" for ipv4 only
+ListenPort = 62206
+Hostname = "localhost:62206" # the hostname of NHP-Server
+LogLevel = 5
+DisableAgentValidation = false
+
+# ─── Demo-only ───────────────────────────────────────────────────────────
+# Accept RFC1918 / loopback / CGNAT addresses as the SourceAddr field of
+# an inner KNK forwarded via nhp-relay (NHP_RLY → HandleRelayForward).
+#
+# Why this is needed for the docker compose demo: when a host browser
+# hits the relay through Docker Desktop's published port mapping, the
+# relay container sees the request as coming from Docker's vpnkit
+# gateway (e.g. 192.168.65.1 on macOS, 172.x.x.x on Linux), and that
+# private address is what gets written into RelayForwardMsg.SourceAddr.
+# The server's default anti-DoS check rejects RFC1918 SourceAddr
+# values because, in production, a public-facing relay should never
+# see one — it would mean the relay was injecting fabricated clients.
+#
+# DO NOT enable this on a production-facing nhp-server. With this
+# flag on, a compromised relay can fill the server's connection map
+# (and the downstream AC ipset whitelist) with any private-range
+# SourceAddr it likes. Keep the default (false) everywhere except in
+# trusted local-only demos like this one.
+AllowPrivateRelaySource = true
+
+# ForceOverload pins the server's Overload flag ON at startup. With it
+# on, every agent goes through the cookie-stamped handshake
+# (KNK → NHP_COK → NHP_RKN) instead of the fast KNK → NHP_ACK path.
+#
+# Why this matters for the local demo: the normal Overload trigger
+# fires only after ~16k concurrent agent connections, which a docker
+# compose demo never produces. Without this flag the cookie path
+# stays dormant and any cookie-related correctness issues (e.g.
+# multi-server cookie-store divergence) are invisible. Flipping this
+# on locally is how a developer exercises and validates the cookie
+# code paths.
+#
+# DO NOT enable this in production. ForceOverload forces every agent
+# through the slower cookie handshake even when the server is idle,
+# and tells the cookie store that load is constantly elevated.
+# Production must rely on the natural connection-count trigger, which
+# is what the threshold is calibrated for.
+#
+# Default: false. Only flip to true when locally validating that the
+# agent's overload / cookie-retry handling works end-to-end; revert
+# before committing any other changes.
+ForceOverload = false
+
+# ─── Cookie (stateless, multi-instance-safe) ──────────────────────────────
+# When the server enters Overload (real load OR ForceOverload), it answers
+# the first KNK from each agent with an NHP_COK challenge containing a
+# cookie; the agent must echo that cookie in an NHP_RKN before the
+# handshake proceeds. Cookies are derived statelessly from
+# HMAC-SHA256(CookieSigningKey, "ip:port" || timeWindow), so any
+# nhp-server in a cluster can verify a cookie a sibling minted — required
+# when agents reach the cluster via round-robin DNS / a load balancer.
+#
+# CookieSigningKeyBase64: base64 of exactly 32 random bytes. Every server
+# in the same cluster MUST share the same value. Leave empty for a
+# single-instance deployment; a random per-process key will be generated
+# at startup (works, but breaks the moment you add a second instance).
+# Generate one with:   head -c 32 /dev/urandom | base64
+#
+# DEMO ONLY — the value below is committed to source for the local docker
+# stack so all replicas in the compose file agree out of the box. Any
+# non-demo deployment MUST regenerate this; reusing the committed value
+# means anyone with a checkout of this repo can mint valid cookies for
+# your cluster.
+CookieSigningKeyBase64 = "w62S2G1P5GOG66Y5tIv3WlfBv8CNBdDe2JJDFr9Q+h0="
+
+# CookieTimeWindowSeconds: cookies rotate every N seconds; the server
+# accepts cookies from the current and the previous window. Default 60s
+# if unset / non-positive, giving an agent [60, 120) seconds to redeem.
+CookieTimeWindowSeconds = 60
+
+
+# AttestationScheme selects the TEE evidence format this server accepts on
+# the DHP knock path.
+#   "csv" (default — also the result of any unrecognised or missing value)
+#         requires a real Hygon CSV attestation report and runs the full
+#         Hygon certificate-chain check.
+#   "test" accepts self-asserted evidence with NO cryptographic assurance.
+#         This exists ONLY for the non-TEE walkthrough in
+#         docs/dhp_quick_start.md §3.4.2 — when the nhp-db / nhp-server
+#         container is running on a machine without a Hygon CSV card, the
+#         attestation report it produces is not a real CSV report, and the
+#         csv verifier would reject it. Setting AttestationScheme = "test"
+#         lets the rest of the quick start complete.
+#
+# NEVER set this to "test" on a host reachable from outside the trust
+# boundary. With "test", any agent that knows the server's public key can
+# knock with self-asserted evidence — there is no hardware-rooted proof
+# of who is on the other end. The server logs Critical at startup and on
+# every reload where the resolved scheme is "test"; treat that line as
+# "you are running with a guard off".
+# AttestationScheme = "test"
+
+
+# [Audit]: tamper-evident, hash-chained security audit ledger. Off by
+# default; see endpoints/server/main/etc/config.toml for the full field
+# docs (Fsync, Async, MaxSizeBytes, MaxSegments, SigningKeyBase64, FailClosed)
+# and the threat model. MaxSizeBytes=0 rotates at a 256 MiB default;
+# MaxSegments=0 keeps every rotated segment (deletion is opt-in, MaxSegments>0).
+# If you enable it on two instances sharing a volume, give each its own
+# FilePath — there is no cross-process lock.
+[Audit]
+Enabled = false
+FilePath = ""
+Fsync = false
+Async = false
+AsyncQueueSize = 0
+MaxSizeBytes = 0
+MaxSegments = 0
+SigningKeyBase64 = ""
+FailClosed = false

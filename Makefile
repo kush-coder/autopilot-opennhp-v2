@@ -1,0 +1,444 @@
+export GO111MODULE := on
+CUSTOM_LD_FLAGS ?=
+
+all: generate-version-and-build
+
+# Repo settings
+GOMODULE = github.com/OpenNHP/opennhp/nhp
+
+# Version and build settings
+MAKEFLAGS += --no-print-directory
+OS_NAME = $(shell uname -s | tr A-Z a-z)
+GOPATH = $(shell go env GOPATH)
+GOMOBILE = $(shell which gomobile 2>/dev/null || echo $(GOPATH)/bin/gomobile)
+XCODE_APP = $(shell test -d /Applications/Xcode.app && echo found || echo "")
+XCODE_SELECT = $(shell xcode-select -p 2>/dev/null | grep -q Xcode.app && echo found || echo "")
+
+# Version number auto increment
+TIMESTAMP=$(shell date +%y%m%d%H%M%S)
+VERSION = $(shell cat nhp/version/VERSION).$(TIMESTAMP)
+# Other version settings. Fall back to "unknown" when .git is absent
+# (e.g. a docker build whose context excludes .git via .dockerignore) so
+# the daemon reports a visible "unknown" instead of an empty commit id.
+COMMIT_ID = $(shell git show -s --format=%H 2>/dev/null || echo unknown)
+COMMIT_TIME = $(shell git show -s --format=%cd --date=format:'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)
+BUILD_TIME = $(shell date "+%Y-%m-%d %H:%M:%S")
+# Built Package File Name
+PACKAGE_FILE = opennhp-$(VERSION).tar.gz
+# Go build flags
+LD_FLAGS = "${CUSTOM_LD_FLAGS} -s -w -X '${GOMODULE}/version.Version=${VERSION}' -X '${GOMODULE}/version.CommitId=${COMMIT_ID}' -X '${GOMODULE}/version.CommitTime=${COMMIT_TIME}' -X '${GOMODULE}/version.BuildTime=${BUILD_TIME}'"
+
+# Color definition
+COLOUR_GREEN=\033[0;32m
+COLOUR_RED=\033[0;31m
+COLOUR_BLUE=\033[0;34m
+END_COLOUR=\033[0m
+
+# Plugins
+NHP_SERVER_PLUGINS = ./examples/server_plugin/basic
+NHP_AUTHENTICATOR_PLUGINS = ./examples/server_plugin/authenticator
+
+# Android environment settings
+ANDROID_CC='${TOOLCHAIN}/bin/aarch64-linux-android21-clang'
+ANDROID_CXX='${TOOLCHAIN}/bin/aarch64-linux-android21-clang++'
+
+# eBPF compile
+ifneq (,$(findstring ebpf,$(MAKECMDGOALS)))
+    CLANG := $(shell command -v clang 2>/dev/null)
+    ifeq ($(CLANG),)
+        $(error "clang is not installed. Please install clang to compile eBPF programs.")
+    endif
+endif
+
+EBPF_SRC_XDP = ./nhp/ebpf/xdp/nhp_ebpf_xdp.c
+EBPF_SRC_TC_EGRESS = ./nhp/ebpf/xdp/tc_egress.c
+# The nhp-server's ingress filter. Standalone: it shares no map schema with
+# the AC objects above, so it does not depend on nhp_maps.h.
+EBPF_SRC_SERVER_XDP = ./nhp/ebpf/xdp/nhp_server_xdp.c
+# Shared map definitions included by both sources; a change here must rebuild both.
+EBPF_HDR_MAPS = ./nhp/ebpf/xdp/nhp_maps.h
+EBPF_OBJ_XDP = ./release/nhp-ac/etc/nhp_ebpf_xdp.o
+EBPF_OBJ_TC_EGRESS = ./release/nhp-ac/etc/tc_egress.o
+EBPF_OBJ_SERVER_XDP = ./release/nhp-server/etc/nhp_server_xdp.o
+CLANG_OPTS = -O2 -target bpf -g -Wall -I.
+
+.PHONY: ebpf
+ebpf: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS) $(EBPF_OBJ_SERVER_XDP) generate-version-and-build
+	@echo "$(COLOUR_GREEN)[eBPF] Full build completed$(END_COLOUR)"
+
+# Compile only the eBPF object files, without the full
+# generate-version-and-build rebuild that the `ebpf` target pulls in.
+# Used by the demo pipeline, which builds the daemons with `make serverd acd
+# relayd plugins` and only needs the objects on top. The clang guard above
+# keys on the substring "ebpf" in MAKECMDGOALS, so this target is covered too.
+# Requires libbpf-dev: the sources #include <bpf/bpf_helpers.h> etc., which
+# are not vendored (vmlinux.h is).
+#
+# Deliberately NOT a prerequisite of `acd` / `serverd`: those must keep
+# building on a host with no clang, which is why the daemon targets and the
+# object targets are separate goals the pipeline invokes in sequence. Both
+# daemons treat a missing object as a runtime condition, not a build error
+# (nhp-acd refuses to start in FilterMode=1; nhp-serverd falls open).
+.PHONY: ebpf-objs
+ebpf-objs: $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS) $(EBPF_OBJ_SERVER_XDP)
+	@echo "$(COLOUR_GREEN)[eBPF] Object files compiled$(END_COLOUR)"
+
+$(EBPF_OBJ_XDP): $(EBPF_SRC_XDP) $(EBPF_HDR_MAPS)
+	@mkdir -p $(@D)
+	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
+	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_XDP) -o $(EBPF_OBJ_XDP)
+$(EBPF_OBJ_TC_EGRESS): $(EBPF_SRC_TC_EGRESS) $(EBPF_HDR_MAPS)
+	@mkdir -p $(@D)
+	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
+	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_TC_EGRESS) -o $(EBPF_OBJ_TC_EGRESS)
+$(EBPF_OBJ_SERVER_XDP): $(EBPF_SRC_SERVER_XDP)
+	@mkdir -p $(@D)
+	@echo "$(COLOUR_BLUE)[eBPF] Compiling: $< -> $@ $(END_COLOUR)"
+	$(CLANG) $(CLANG_OPTS) -c $(EBPF_SRC_SERVER_XDP) -o $(EBPF_OBJ_SERVER_XDP)
+
+clean_ebpf:
+	@rm -f $(EBPF_OBJ_XDP) $(EBPF_OBJ_TC_EGRESS) $(EBPF_OBJ_SERVER_XDP)
+	@echo "$(COLOUR_GREEN)[Clean] Removed eBPF object file$(END_COLOUR)"
+
+generate-version-and-build:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Start building... $(END_COLOUR)"
+	@echo "$(COLOUR_BLUE)Version: ${VERSION} $(END_COLOUR)"
+	@echo "$(COLOUR_BLUE)Commit id: ${COMMIT_ID} $(END_COLOUR)"
+	@echo "$(COLOUR_BLUE)Commit time: ${COMMIT_TIME} $(END_COLOUR)"
+	@echo "$(COLOUR_BLUE)Build time: ${BUILD_TIME} $(END_COLOUR)"
+	@$(MAKE) init
+	@$(MAKE) agentd
+	@$(MAKE) acd
+	@$(MAKE) serverd
+	@$(MAKE) db
+	@$(MAKE) kgc
+	@$(MAKE) linuxagentsdk
+	@$(MAKE) androidagentsdk
+	@$(MAKE) macosagentsdk
+	@$(MAKE) iosagentsdk
+	@$(MAKE) devicesdk
+	@$(MAKE) plugins
+	@$(MAKE) archive
+	@echo "$(COLOUR_GREEN)[OpenNHP] Build for platform ${OS_NAME} successfully done!$(END_COLOUR)"
+
+init:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Initializing... $(END_COLOUR)"
+	@# `git clean` only works in a real checkout. Container builds (and
+	@# git worktrees whose .git pointer targets a host path not present
+	@# in the image) have no usable repo, so fall back to rm -rf release.
+	@if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		git clean -df release; \
+	else \
+		rm -rf release; \
+	fi
+	cd nhp && go mod download && go mod tidy
+	cd endpoints && go mod download && go mod tidy
+	@for dir in ./examples/server_plugin/*/; do \
+		if [ -f "$$dir/go.mod" ]; then \
+			echo "$(COLOUR_BLUE)[Plugin-$$(basename $$dir)] Running go mod download... $(END_COLOUR)"; \
+			cd "$$dir" && go mod download && go mod tidy && cd - > /dev/null; \
+		else \
+			for subdir in "$$dir"/*/; do \
+				if [ -f "$$subdir/go.mod" ]; then \
+					echo "$(COLOUR_BLUE)[Plugin-$$(basename $$subdir)] Running go mod download... $(END_COLOUR)"; \
+					cd "$$subdir" && go mod download && go mod tidy && cd - > /dev/null; \
+				fi \
+			done \
+		fi \
+	done
+
+# Use this target when you need to update dependencies (will modify go.sum)
+tidy:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running go mod tidy... $(END_COLOUR)"
+	cd nhp && go mod tidy
+	cd endpoints && go mod tidy
+	@for dir in ./examples/server_plugin/*/; do \
+		if [ -f "$$dir/go.mod" ]; then \
+			echo "$(COLOUR_BLUE)[Plugin-$$(basename $$dir)] Running go mod tidy... $(END_COLOUR)"; \
+			cd "$$dir" && go mod tidy && cd - > /dev/null; \
+		else \
+			for subdir in "$$dir"/*/; do \
+				if [ -f "$$subdir/go.mod" ]; then \
+					echo "$(COLOUR_BLUE)[Plugin-$$(basename $$subdir)] Running go mod tidy... $(END_COLOUR)"; \
+					cd "$$subdir" && go mod tidy && cd - > /dev/null; \
+				fi \
+			done \
+		fi \
+	done
+	@echo "$(COLOUR_GREEN)[OpenNHP] go mod tidy complete. Remember to commit go.sum files!$(END_COLOUR)"
+
+agentd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-agent... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-agent/nhp-agentd ./agent/main/main.go && \
+	cp ./agent/main/etc/*.toml ../release/nhp-agent/etc/ && \
+	cp -rf ./agent/main/etc/certs ../release/nhp-agent/etc/
+
+acd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-ac... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-ac/nhp-acd ./ac/main/main.go && \
+	cp ./ac/main/etc/*.toml ../release/nhp-ac/etc/
+
+serverd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-server... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-server/nhp-serverd ./server/main/main.go && \
+	mkdir -p ../release/nhp-server/etc; \
+	cp ./server/main/etc/*.toml ../release/nhp-server/etc/
+
+db:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-db... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-db/nhp-db ./db/main/main.go && \
+	mkdir -p ../release/nhp-db/etc; \
+	cp ./db/main/etc/*.toml ../release/nhp-db/etc/
+
+kgc:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-kgc... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-kgc/nhp-kgc ./kgc/main/main.go && \
+	mkdir -p ../release/nhp-kgc/etc; \
+	cp ./kgc/main/etc/*.toml ../release/nhp-kgc/etc/
+
+relayd:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-relay... $(END_COLOUR)"
+	cd endpoints && \
+	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-relay/nhp-relayd ./relay/main/main.go && \
+	mkdir -p ../release/nhp-relay/etc; \
+	cp ./relay/main/etc/*.toml ../release/nhp-relay/etc/
+
+# demoapp is a separate Go module (depends on nhp via a local replace).
+# Build the backend only; the bundled SPA ship-in-binary path uses the
+# docker build (Dockerfile.demoapp). `go build ./...` is enough for CI
+# to catch compile errors, vet failures, and missing deps.
+demoapp:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building demoapp... $(END_COLOUR)"
+	cd demoapp && go build ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] demoapp build complete$(END_COLOUR)"
+
+# init-demoapp / test-demoapp keep the demoapp module's dependency
+# download + test suite OUT of the shared init/test targets. The shared
+# targets are invoked by the daemon Dockerfiles (Dockerfile.server/.ac/
+# .relay/.db/.agent run `make init` / `make test`), so pulling demoapp
+# in there would drag gin/go-oidc/oauth2/modernc-sqlite/bcrypt into
+# every daemon image and run the demoapp test suite during an nhp-db
+# image build. Demoapp is built + tested via these targets and the CI
+# workflow instead.
+init-demoapp:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Initializing demoapp module... $(END_COLOUR)"
+	cd demoapp && go mod download && go mod tidy
+	@echo "$(COLOUR_GREEN)[OpenNHP] demoapp module initialized$(END_COLOUR)"
+
+test-demoapp:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running demoapp tests... $(END_COLOUR)"
+	cd demoapp && go test -v ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] demoapp tests passed!$(END_COLOUR)"
+
+linuxagentsdk:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building Linux agent SDK... $(END_COLOUR)"
+ifeq ($(OS_NAME), linux)
+	cd endpoints && \
+	go build -a -trimpath -buildmode=c-shared -ldflags ${LD_FLAGS} -v -o ../release/nhp-agent/nhp-agent.so ./agent/main/main.go ./agent/main/export.go
+endif
+
+androidagentsdk:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building Android agent SDK... $(END_COLOUR)"
+ifeq ($(OS_NAME), linux)
+    ifeq ($(TOOLCHAIN),)
+		@echo "Android NDK is not installed. Please install Android NDK to compile Android SDK."
+    else
+		cd endpoints && \
+		GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+		CC=${ANDROID_CC} CXX=${ANDROID_CXX} \
+		go build -a -trimpath -buildmode=c-shared -ldflags ${LD_FLAGS} -v -o ../release/nhp-agent/libnhpagent.so ./agent/main/main.go ./agent/main/export.go
+    endif
+endif
+
+
+macosagentsdk:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building MacOS agent SDK... $(END_COLOUR)"
+ifeq ($(OS_NAME), darwin)
+ifeq (, $(shell test -f $(GOMOBILE) && echo found))
+	$(error "No gomobile found, consider doing `go install golang.org/x/mobile/cmd/gomobile@latest`")
+endif
+	cd endpoints && \
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+	go build -a -trimpath -buildmode=c-shared -ldflags ${LD_FLAGS} -v -o ../release/nhp-agent/nhp-agent.dylib ./agent/main/main.go ./agent/main/export.go
+endif
+
+iosagentsdk:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building IOS agent SDK... $(END_COLOUR)"
+ifeq ($(OS_NAME), darwin)
+ifeq (, $(shell test -f $(GOMOBILE) && echo found))
+	@echo "$(COLOUR_RED)[Warning] No gomobile found, skipping iOS SDK build$(END_COLOUR)"
+	@echo "$(COLOUR_RED)Consider doing: go install golang.org/x/mobile/cmd/gomobile@latest$(END_COLOUR)"
+else
+ifeq (, $(XCODE_APP))
+	@echo "$(COLOUR_RED)[Warning] Xcode is not installed, skipping iOS SDK build$(END_COLOUR)"
+	@echo "$(COLOUR_RED)iOS SDK requires full Xcode installation (not just Command Line Tools)$(END_COLOUR)"
+else
+ifeq (, $(XCODE_SELECT))
+	@echo "$(COLOUR_RED)[Warning] xcode-select is not pointing to Xcode.app, skipping iOS SDK build$(END_COLOUR)"
+	@echo "$(COLOUR_RED)Please run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer$(END_COLOUR)"
+else
+	cd endpoints && \
+	PATH=$(GOPATH)/bin:$$PATH $(GOMOBILE) bind -target ios -o ../release/nhp-agent/nhpagent.xcframework ./agent/iossdk
+endif
+endif
+endif
+endif
+
+
+devicesdk:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp SDK... $(END_COLOUR)"
+ifeq ($(OS_NAME), linux)
+	cd nhp && \
+	go build -a -trimpath -buildmode=c-shared -ldflags ${LD_FLAGS} -v -o ../release/nhp-device/nhpdevice.so ./core/main/main.go ./core/main/nhpdevice.go
+#	gcc ./core/sdkdemo/nhp-device-demo.c -I ./release/nhp-device -I ./core/main -l:nhpdevice.so -L./release/nhp-device -Wl,-rpath=. -o ./release/nhp-device/nhp-device-demo
+endif
+
+check-plugin-deps:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking plugin dependency alignment... $(END_COLOUR)"
+	@./scripts/check-plugin-deps.sh
+
+plugins: check-plugin-deps
+	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
+	@for dir in ./examples/server_plugin/*/; do \
+		if [ -f "$$dir/Makefile" ]; then \
+			echo "$(COLOUR_BLUE)[Plugin-$$(basename $$dir)] Building... $(END_COLOUR)"; \
+			$(MAKE) -C "$$dir" || exit 1; \
+		else \
+			for subdir in "$$dir"/*/; do \
+				if [ -f "$$subdir/Makefile" ]; then \
+					echo "$(COLOUR_BLUE)[Plugin-$$(basename $$subdir)] Building... $(END_COLOUR)"; \
+					$(MAKE) -C "$$subdir" || exit 1; \
+				fi \
+			done \
+		fi \
+	done
+# Development build (faster, no version injection)
+dev:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Development build...$(END_COLOUR)"
+	cd nhp && go build ./...
+	cd endpoints && go build ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Development build complete$(END_COLOUR)"
+
+# Run all tests (excludes wasm/policy which requires WASM build tags)
+test:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running tests...$(END_COLOUR)"
+	cd nhp && go test -v $$(go list ./... | grep -v /wasm/policy)
+	cd endpoints && go test -v ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] All tests passed!$(END_COLOUR)"
+
+# Run tests with race detection
+test-race:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running tests with race detection...$(END_COLOUR)"
+	cd nhp && go test -race -v $$(go list ./... | grep -v /wasm/policy)
+	cd endpoints && go test -race -v ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Race detection tests passed!$(END_COLOUR)"
+
+# Format code
+fmt:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Formatting code...$(END_COLOUR)"
+	cd nhp && go fmt ./...
+	cd endpoints && go fmt ./...
+	cd demoapp && go fmt ./...
+	cd examples/server_plugin/basic && go fmt ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Code formatted$(END_COLOUR)"
+
+# Lint code (requires golangci-lint: https://golangci-lint.run/usage/install/)
+lint:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Linting code...$(END_COLOUR)"
+	@which golangci-lint > /dev/null || (echo "$(COLOUR_RED)golangci-lint not found. Install: https://golangci-lint.run/usage/install/$(END_COLOUR)" && exit 1)
+	cd nhp && golangci-lint run ./...
+	cd endpoints && golangci-lint run ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Linting complete$(END_COLOUR)"
+
+# Clean build artifacts
+clean:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Cleaning build artifacts...$(END_COLOUR)"
+	rm -rf release/
+	cd nhp && go clean
+	cd endpoints && go clean
+	@echo "$(COLOUR_GREEN)[OpenNHP] Clean complete$(END_COLOUR)"
+
+# Show available targets
+help:
+	@echo ""
+	@echo "$(COLOUR_BLUE)OpenNHP Makefile$(END_COLOUR)"
+	@echo ""
+	@echo "$(COLOUR_GREEN)Development:$(END_COLOUR)"
+	@echo "  make dev        - Quick development build (no version injection)"
+	@echo "  make test       - Run all tests"
+	@echo "  make test-race  - Run tests with race detection"
+	@echo "  make fmt        - Format code with gofmt"
+	@echo "  make lint       - Lint code with golangci-lint"
+	@echo "  make clean      - Remove build artifacts"
+	@echo ""
+	@echo "$(COLOUR_GREEN)Build:$(END_COLOUR)"
+	@echo "  make            - Build all binaries (default)"
+	@echo "  make init       - Download dependencies (preserves go.sum)"
+	@echo "  make tidy       - Update dependencies (modifies go.sum)"
+	@echo "  make agentd     - Build nhp-agent"
+	@echo "  make serverd    - Build nhp-server"
+	@echo "  make acd        - Build nhp-ac"
+	@echo "  make db         - Build nhp-db"
+	@echo "  make kgc        - Build nhp-kgc"
+	@echo "  make relayd     - Build nhp-relay"
+	@echo "  make demoapp    - Build the demo app backend (separate module)"
+	@echo "  make init-demoapp - Download + tidy the demoapp module deps"
+	@echo "  make test-demoapp - Run the demoapp test suite"
+	@echo "  make plugins    - Build server plugins"
+	@echo ""
+	@echo "$(COLOUR_GREEN)SDK:$(END_COLOUR)"
+	@echo "  make linuxagentsdk    - Build Linux agent SDK (.so)"
+	@echo "  make macosagentsdk    - Build macOS agent SDK (.dylib)"
+	@echo "  make iosagentsdk      - Build iOS agent SDK (.xcframework)"
+	@echo "  make androidagentsdk  - Build Android agent SDK (.so)"
+	@echo "  make devicesdk        - Build device SDK"
+	@echo ""
+	@echo "$(COLOUR_GREEN)Other:$(END_COLOUR)"
+	@echo "  make ebpf       - Compile eBPF programs (requires clang)"
+	@echo "  make ebpf-objs  - Compile only the eBPF object files (requires clang + libbpf-dev)"
+	@echo "  make archive    - Package binaries for distribution"
+	@echo "  make help       - Show this help message"
+	@echo ""
+
+# Run fuzz tests (60 seconds each by default)
+fuzz:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running fuzz tests...$(END_COLOUR)"
+	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=60s ./test/
+	cd nhp && go test -fuzz=FuzzAESDecrypt -fuzztime=60s ./test/
+	cd nhp && go test -fuzz=FuzzHeaderTypeToDeviceType -fuzztime=60s ./test/
+	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=60s ./test/
+	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
+
+# Run fuzz tests briefly (for CI)
+fuzz-quick:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running quick fuzz tests...$(END_COLOUR)"
+	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=10s ./test/
+	cd nhp && go test -fuzz=FuzzAESDecrypt -fuzztime=10s ./test/
+	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=10s ./test/
+	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
+
+# Run tests with coverage
+coverage:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running tests with coverage...$(END_COLOUR)"
+	cd nhp && go test -coverprofile=coverage.out -covermode=atomic ./...
+	cd endpoints && go test -coverprofile=coverage.out -covermode=atomic ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Coverage reports generated$(END_COLOUR)"
+
+# View coverage report in browser
+coverage-html:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Generating HTML coverage reports...$(END_COLOUR)"
+	cd nhp && go tool cover -html=coverage.out -o coverage.html
+	cd endpoints && go tool cover -html=coverage.out -o coverage.html
+	@echo "$(COLOUR_GREEN)[OpenNHP] Coverage reports: nhp/coverage.html, endpoints/coverage.html$(END_COLOUR)"
+
+archive:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Start archiving... $(END_COLOUR)"
+	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
+	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
+
+.PHONY: all generate-version-and-build init tidy agentd acd serverd db kgc relayd demoapp init-demoapp test-demoapp linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins check-plugin-deps dev test test-race fmt lint clean help fuzz fuzz-quick coverage coverage-html archive ebpf ebpf-objs clean_ebpf

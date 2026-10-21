@@ -1,0 +1,77 @@
+# NHP Relay Service Configuration
+
+# HTTP listener
+listenIp   = "0.0.0.0"
+listenPort = 8080
+
+# TLS (set enableTLS = true and provide cert/key paths for production HTTPS)
+enableTLS   = false
+tlsCertFile = ""
+tlsKeyFile  = ""
+
+# Cipher scheme: 0 = Curve25519 (default), 1 = SM2/GMSM.
+cipherScheme = 0
+
+# Relay identity key — generate with: nhp-relayd keygen --curve (or --sm2).
+# Accepts a plain base64 key or a sealed blob (starts with "v1$") produced
+# by:  echo "$KEY" | nhp-relayd seal
+# A sealed key is decrypted at startup with a passphrase supplied out of
+# band. Prefer NHP_KEY_PASSPHRASE_FILE (a file, mode 0600) over
+# NHP_KEY_PASSPHRASE: an env var is readable from the process environment,
+# ends up in unit files and crash dumps, and is inherited by children.
+# The passphrase env vars are consulted only when this value is a sealed
+# blob, so a plain base64 key is unaffected by a stray NHP_KEY_PASSPHRASE_FILE
+# left exported on the host.
+privateKeyBase64 = ""
+
+# Keepalive interval in seconds
+keepaliveIntervalS = 20
+
+# Timeouts in milliseconds
+readTimeoutMs  = 10000
+writeTimeoutMs = 10000
+idleTimeoutMs  = 60000
+udpTimeoutMs   = 5000
+
+# Log level: 0=silent, 1=error, 2=info, 3=debug
+logLevel = 2
+
+# [Metrics]: optional Prometheus /metrics + JSON /healthz endpoint.
+#   Enabled: off by default. When true, a separate HTTP listener is started.
+#   ListenIp: bind address. Empty defaults to 127.0.0.1 so telemetry is not
+#     reachable off-host; set an explicit IP only if a scraper needs remote
+#     access (firewall it in that case).
+#   ListenPort: TCP port, defaults to 9102 when empty/zero (distinct from
+#     nhp-server 9100 and nhp-ac 9101).
+#   Read once at startup; changing it needs a restart.
+[Metrics]
+Enabled = false
+ListenIp = "127.0.0.1"
+ListenPort = 9102
+
+# ────────────────────────────────────────────────────────────────────────
+# Upstream NHP-Server entries
+# ────────────────────────────────────────────────────────────────────────
+#
+# Each [[Servers]] entry describes one logical nhp-server identity (one
+# pubkey), addressed by the SHA-256 fingerprint of its public key.
+# Clients reach a server via
+#   POST /relay/<serverId>
+# where <serverId> is the 11-char fingerprint printed in the relay logs
+# at startup (also available from GET /servers). There is no default
+# server: every request must carry the id in the URL.
+#
+# Schema is identical to nhp-agent/nhp-ac/nhp-db's server.toml — same
+# field names, same [[Servers]] block, same [[Servers.Instances]]
+# sub-table. See nhp/common/clusterconfig for the canonical reference.
+
+[[Servers]]
+Name         = "default"
+PubKeyBase64 = ""
+LoadBalance  = "weighted-random"
+ExpireTime   = 1924991999
+
+  [[Servers.Instances]]
+  Host   = "127.0.0.1"
+  Port   = 62206
+  Weight = 1

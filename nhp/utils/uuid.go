@@ -1,0 +1,52 @@
+package utils
+
+import (
+	"errors"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NewUUID generates a UUID using math/rand. For cryptographically secure UUIDs,
+// use GenerateUUIDv4() instead which uses crypto/rand.
+//
+//nolint:gosec // G404: math/rand is acceptable for non-security UUID generation
+func NewUUID() (string, error) {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	uuid := make([]byte, 16)
+	_, err := rng.Read(uuid)
+	if err != nil {
+		return "", errors.New("failed to generate UUID: " + err.Error())
+	}
+
+	// Set version bits (version 4)
+	uuid[6] = (uuid[6] & 0x0F) | 0x40
+	// Set variant bits (variant 1)
+	uuid[8] = (uuid[8] & 0x3F) | 0x80
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:]), nil
+}
+
+// RandNumber returns a random 4-digit number (1000-10999) for non-security purposes.
+//
+//nolint:gosec // G404: math/rand is acceptable for non-security random numbers
+func RandNumber() int {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	randomNumber := rng.Intn(10000)
+	if randomNumber < 1000 {
+		randomNumber += 1000
+	}
+
+	return randomNumber
+}
+
+// GenerateUUIDv4 creates a random UUID (version 4)
+func GenerateUUIDv4() (string, error) {
+	u, err := uuid.NewRandom()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate UUID v4: %w", err)
+	}
+	return u.String(), nil
+}

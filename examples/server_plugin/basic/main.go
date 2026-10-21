@@ -1,0 +1,626 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/mail"
+	"net/smtp"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
+	nhplog "github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
+	"github.com/OpenNHP/opennhp/nhp/utils"
+	"github.com/gin-gonic/gin"
+
+	toml "github.com/pelletier/go-toml/v2"
+)
+
+type config struct {
+	ExampleUsername string
+	ExamplePassword string
+	// SMTP settings for OTP email delivery.
+	SMTPHost     string `toml:"smtp_host"`
+	SMTPPort     string `toml:"smtp_port"`
+	SMTPUsername string `toml:"smtp_username"`
+	SMTPPassword string `toml:"smtp_password"`
+	SMTPFrom     string `toml:"smtp_from"`
+	SMTPSubject  string `toml:"smtp_subject"`
+	// SMTPCodeInSubject, when true (the default when unset), appends the
+	// 6-digit OTP to the email subject for inbox-preview visibility. Set to
+	// false to keep the code out of the Subject header (it is always in the
+	// body); the subject is the least-protected part of a message.
+	SMTPCodeInSubject *bool `toml:"smtp_code_in_subject"`
+	// RequireEmailMatch, when true, enforces that the email address
+	// supplied in UserData matches the claimed userId. This is the
+	// minimum identity-binding check for a demo deployment.
+	// Defaults to true when not explicitly set in config.
+	RequireEmailMatch *bool `toml:"require_email_match"`
+}
+
+var (
+	// Example Plugin Settings
+	log           *nhplog.Logger
+	pluginDirPath string
+	hostname      string
+	localIp       string
+	localMac      string
+)
+
+var (
+	name    = "example"
+	version = "0.2.0" // RegisterKeyFunc gained a cipherScheme parameter (dual-cipher support)
+
+	baseConfigWatch io.Closer
+	resConfigWatch  io.Closer
+
+	baseConf         *config
+	resourceMapMutex sync.Mutex
+	resourceMap      common.ResourceGroupMap
+)
+
+var (
+	errLoadConfig = fmt.Errorf("config load error")
+)
+
+func Version() string {
+	return fmt.Sprintf("%s v%s", name, version)
+}
+
+func Init(in *plugins.PluginParamsIn) error {
+	if in.PluginDirPath != nil {
+		pluginDirPath = *in.PluginDirPath
+	}
+	if in.Log != nil {
+		log = in.Log
+	}
+	if in.Hostname != nil {
+		hostname = *in.Hostname
+	}
+	if in.LocalIp != nil {
+		localIp = *in.LocalIp
+	}
+	if in.LocalMac != nil {
+		localMac = *in.LocalMac
+	}
+
+	// load config
+	fileNameBase := (filepath.Join(pluginDirPath, "etc", "config.toml"))
+	if err := updateConfig(fileNameBase); err != nil {
+		// ignore error
+		_ = err
+	}
+
+	baseConfigWatch = utils.WatchFile(fileNameBase, func() {
+		log.Info("base config: %s has been updated", fileNameBase)
+		updateConfig(fileNameBase)
+	})
+
+	fileNameRes := filepath.Join(pluginDirPath, "etc", "resource.toml")
+	if err := updateResource(fileNameRes); err != nil {
+		// ignore error
+		_ = err
+	}
+	resConfigWatch = utils.WatchFile(fileNameRes, func() {
+		log.Info("resource config: %s has been updated", fileNameRes)
+		updateResource(fileNameRes)
+	})
+
+	return nil
+}
+
+func updateConfig(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Error("failed to read base config: %v", err)
+	}
+
+	var conf config
+	if err := toml.Unmarshal(content, &conf); err != nil {
+		log.Error("failed to unmarshal base config: %v", err)
+	}
+
+	baseConf = &conf
+	return err
+}
+
+func updateResource(file string) (err error) {
+	utils.CatchPanicThenRun(func() {
+		err = errLoadConfig
+	})
+
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Error("failed to read resource config: %v", err)
+	}
+
+	resourceMapMutex.Lock()
+	defer resourceMapMutex.Unlock()
+
+	resourceMap = make(common.ResourceGroupMap)
+	if err := toml.Unmarshal(content, &resourceMap); err != nil {
+		log.Error("failed to unmarshal resource config: %v", err)
+	}
+
+	// res is pointer so we can update its fields
+	for resId, res := range resourceMap {
+		res.AuthServiceId = name
+		res.ResourceId = resId
+	}
+
+	return err
+}
+
+func Close() error {
+	if baseConfigWatch != nil {
+		baseConfigWatch.Close()
+	}
+	if resConfigWatch != nil {
+		resConfigWatch.Close()
+	}
+	return nil
+}
+
+func findResource(resId string) *common.ResourceData {
+	resourceMapMutex.Lock()
+	defer resourceMapMutex.Unlock()
+
+	res, found := resourceMap[resId]
+	if found {
+		return res
+	}
+	return nil
+}
+
+func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
+	if helper == nil {
+		return nil, fmt.Errorf("AuthWithHttp: helper is null")
+	}
+
+	resId := ctx.Query("resid")
+	action := ctx.Query("action")
+	if len(resId) > 0 && strings.Contains(resId, "|") {
+		params := strings.Split(resId, "|")
+		resId = params[0]
+		if len(params) > 1 {
+			action = params[1]
+		}
+	}
+
+	res := findResource(resId)
+	if res == nil || len(res.Resources) == 0 {
+		ackMsg = nil
+		err = common.ErrResourceNotFound
+		log.Error("resource error: %v", err)
+		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
+		return
+	}
+
+	corsMiddleware(ctx)
+
+	switch {
+	case strings.EqualFold(action, "valid"):
+		ackMsg, err = authRegular(ctx, req, res, helper)
+
+	case strings.EqualFold(action, "login"):
+		ackMsg, err = authAndShowLogin(ctx, req, res, helper)
+
+	default:
+		ackMsg = nil
+		err = fmt.Errorf("action invalid")
+	}
+	return
+}
+
+func authAndShowLogin(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	_ = helper
+
+	if res.ExInfo == nil {
+		log.Error("extra login info not available")
+		ctx.String(http.StatusOK, "{\"errMsg\": \"extra login info not available\"}")
+		return nil, fmt.Errorf("extra login info not available")
+	}
+
+	ctx.HTML(http.StatusOK, "example/example_login.html", gin.H{
+		"title":     res.ExInfo["Title"].(string),
+		"nhpServer": hostname,
+		"aspId":     req.AuthServiceId,
+		"resId":     res.ResourceId,
+	})
+
+	return nil, nil
+}
+
+func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	var err error
+	username, _ := url.QueryUnescape(ctx.Query("username"))
+	password, _ := url.QueryUnescape(ctx.Query("password"))
+
+	if !strings.EqualFold(username, baseConf.ExampleUsername) || !strings.EqualFold(password, baseConf.ExamplePassword) {
+		log.Info("Authenticating user: %s failed!", username)
+		return nil, fmt.Errorf("user or password is incorrect")
+	}
+
+	// interact with udp server for ac operation
+	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
+	if ackMsg == nil || ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+		log.Error("knock failed. ackMsg is nil")
+		ackMsg = &common.ServerKnockAckMsg{}
+		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+	} else {
+		log.Info("knock succeeded.")
+		ackMsg.ErrMsg = ""
+		// assign the redirect url to the ackMsg
+		if len(res.RedirectUrl) == 0 {
+			log.Error("RedirectUrl is not provided.")
+		} else {
+			ackMsg.RedirectUrl = res.RedirectUrl
+		}
+
+		// set cookies
+		// note that a dot in domain prefix used to make a difference, but now it doesn't (RFC6265).
+		// The cookie will be sent to any subdomain of the specified domain, with or without the leading dot.
+		singleHost := len(ackMsg.ACTokens) == 1
+		for resName, token := range ackMsg.ACTokens {
+			if singleHost {
+				ctx.SetCookie(
+					"nhp-token",            // Name
+					url.QueryEscape(token), // Value
+					int(res.OpenTime),      // MaxAge - use the knock interval time
+					"/",                    // Path
+					res.CookieDomain,       // Domain
+					true,                   // Secure - if true, this cookie will only be sent on https, not http
+					true)                   // HttpOnly - if true, this cookie will only be sent on http(s)
+			} else {
+				domain := strings.Split(ackMsg.ResourceHost[resName], ":")[0]
+				ctx.SetCookie(
+					"nhp-token"+"/"+resName, // Name
+					url.QueryEscape(token),  // Value
+					int(res.OpenTime),       // MaxAge - use the knock interval time
+					"/",                     // Path
+					domain,                  // Domain
+					true,                    // Secure - if true, this cookie will only be sent on https, not http
+					true)                    // HttpOnly - if true, this cookie will only be sent on http(s)
+			}
+			log.Info("ctx.SetCookie.")
+		}
+	}
+	ctx.JSON(http.StatusOK, ackMsg)
+	return ackMsg, nil
+}
+
+func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
+	ackMsg = req.Ack
+	if helper == nil {
+		return ackMsg, fmt.Errorf("AuthWithNHP: helper is null")
+	}
+
+	var found bool
+	var res *common.ResourceData
+	resourceMapMutex.Lock()
+	res, found = resourceMap[req.Msg.ResourceId]
+	resourceMapMutex.Unlock()
+
+	if !found || len(res.Resources) == 0 {
+		err = common.ErrResourceNotFound
+		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return
+	}
+
+	// there is no backend auth in this plugin, fail the request if SkipAuth is false
+	if !res.SkipAuth {
+		err = common.ErrBackendAuthRequired
+		ackMsg.ErrCode = common.ErrBackendAuthRequired.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return
+	}
+
+	// skip backend auth and continue with AC operations
+	log.Info("agent user [%s]: skip auth", req.Msg.UserId)
+	ackMsg.OpenTime = res.OpenTime
+
+	// PART III: request ac operation for each resource and block for response
+	ackMsg, err = helper.AuthWithNhpCallbackFunc(req, res)
+
+	return ackMsg, err
+}
+
+// ── Plugin metadata exports ──────────────────────────────────────────────
+
+func Signature() string {
+	return name + "/" + version
+}
+
+func ExportedData() *plugins.PluginParamsOut {
+	return &plugins.PluginParamsOut{}
+}
+
+// ── OTP and registration ─────────────────────────────────────────────────
+
+// RequestOTP generates a one-time password, sends it via email, and stores
+// it via the server's key store.
+//
+// SECURITY: The recipient email address is taken from req.Msg.UserData["email"],
+// which is caller-supplied. In production, the ASP MUST verify that the
+// claimed userId is bound to that email address (e.g., pre-verified identity
+// from an SSO assertion, a confirmed email in a user directory, or an OIDC
+// id_token claim). Without this check, an attacker who controls an inbox can
+// register a public key under any userId.
+//
+// This example plugin demonstrates the minimum check via the
+// RequireEmailMatch config option (default true), which validates that
+// the email matches userId. For a real deployment, replace this with
+// your identity provider's verification.
+func RequestOTP(req *common.NhpOTPRequest, helper *plugins.NhpServerPluginHelper) error {
+	if helper == nil || helper.GenerateOTPFunc == nil {
+		return fmt.Errorf("RequestOTP: keystore helper not available")
+	}
+
+	// Extract email from UserData.
+	to := req.Msg.UserData["email"]
+	emailAddr, ok := to.(string)
+	if !ok || emailAddr == "" {
+		emailAddr = req.Msg.UserId // fallback: use userId as email
+		log.Warning("RequestOTP: no email in UserData, using userId as email recipient")
+	}
+
+	// Identity-binding check: when enabled (default), reject requests
+	// where the email does not equal the claimed userId. This check runs
+	// BEFORE OTP generation so rejected requests have no side effects
+	// (no OTP state rotation, no email send).
+	requireMatch := true // default
+	if baseConf != nil && baseConf.RequireEmailMatch != nil {
+		requireMatch = *baseConf.RequireEmailMatch
+	}
+	if requireMatch && emailAddr != req.Msg.UserId {
+		return fmt.Errorf("RequestOTP: email %s does not match userId %s", emailAddr, req.Msg.UserId)
+	}
+
+	// Use server-configured OTP TTL (default 300s = 5 min).
+	ttl := helper.OTPTTLSeconds
+	if ttl <= 0 {
+		ttl = 300
+	}
+	// Bind the agent's public key (from the NHP-OTP message) to the OTP at
+	// issuance. ValidateOTP later rejects a NHP-REG that presents this OTP
+	// with a different key (stolen-OTP defense).
+	otpCode, err := helper.GenerateOTPFunc(req.Msg.UserId, req.Msg.DeviceId, req.PublicKey, ttl)
+	if err != nil {
+		log.Error("RequestOTP: generate otp failed: %v", err)
+		return err
+	}
+
+	// Send OTP via email.
+	if err := sendOTPEmail(emailAddr, otpCode); err != nil {
+		log.Error("RequestOTP: send email failed: %v", err)
+		return err
+	}
+
+	log.Info("RequestOTP: otp[%s] sent to %s for user=%s device=%s", otpCode, emailAddr, req.Msg.UserId, req.Msg.DeviceId)
+	return nil
+}
+
+// RegisterAgent validates the OTP and registers the agent's public key.
+func RegisterAgent(req *common.NhpRegisterRequest, helper *plugins.NhpServerPluginHelper) (*common.ServerRegisterAckMsg, error) {
+	ack := req.Ack
+	if ack == nil {
+		ack = &common.ServerRegisterAckMsg{}
+	}
+
+	if helper == nil || helper.ValidateOTPFunc == nil || helper.RegisterKeyFunc == nil {
+		err := fmt.Errorf("RegisterAgent: keystore helper not available")
+		ack.ErrCode = common.ErrAgentKeyStoreError.ErrorCode()
+		ack.ErrMsg = err.Error()
+		return ack, err
+	}
+
+	// Step 1: validate OTP.
+	if err := helper.ValidateOTPFunc(req.Msg.UserId, req.Msg.DeviceId, req.Msg.OTP, req.PublicKey); err != nil {
+		log.Error("RegisterAgent: otp validation failed for user=%s: %v", req.Msg.UserId, err)
+		ack.ErrCode = common.ErrorToErrorCode(err)
+		ack.ErrMsg = common.ErrorToString(err)
+		return ack, err
+	}
+
+	// Step 2: register the agent's public key.
+	if err := helper.RegisterKeyFunc(req.Msg.UserId, req.Msg.DeviceId, req.PublicKey, req.CipherScheme); err != nil {
+		log.Error("RegisterAgent: register key failed for user=%s: %v", req.Msg.UserId, err)
+		ack.ErrCode = common.ErrorToErrorCode(err)
+		ack.ErrMsg = common.ErrorToString(err)
+		return ack, err
+	}
+
+	// Step 3: echo the stored expiry back to the agent so the SDK can
+	// show "valid until <date>" instead of computing it client-side.
+	// GetAgentKeyExpiry is nil-safe: if the helper did not wire it
+	// (older server), we simply omit ExpiresAt from the ack.
+	if helper.GetAgentKeyExpiryFunc != nil {
+		if _, exp, err := helper.GetAgentKeyExpiryFunc(req.Msg.UserId, req.Msg.DeviceId); err == nil {
+			ack.ExpiresAt = exp
+		} else {
+			log.Warning("RegisterAgent: read expiry failed for user=%s: %v", req.Msg.UserId, err)
+		}
+	}
+
+	ack.ErrCode = common.ErrSuccess.ErrorCode()
+	ack.AuthServiceId = req.Msg.AuthServiceId
+	if ack.ExpiresAt != nil {
+		log.Info("RegisterAgent: registered user=%s device=%s expiresAt=%d", req.Msg.UserId, req.Msg.DeviceId, *ack.ExpiresAt)
+	} else {
+		log.Info("RegisterAgent: registered user=%s device=%s (no expiry)", req.Msg.UserId, req.Msg.DeviceId)
+	}
+	return ack, nil
+}
+
+// ListService returns the list of available services for the agent.
+func ListService(req *common.NhpListRequest, helper *plugins.NhpServerPluginHelper) (*common.ServerListResultMsg, error) {
+	ack := req.Ack
+	if ack == nil {
+		ack = &common.ServerListResultMsg{}
+	}
+
+	resourceMapMutex.Lock()
+	defer resourceMapMutex.Unlock()
+
+	if ack.ListResults == nil {
+		ack.ListResults = make(map[string]any)
+	}
+	for resId := range resourceMap {
+		ack.ListResults[resId] = nil
+	}
+
+	ack.ErrCode = common.ErrSuccess.ErrorCode()
+	return ack, nil
+}
+
+// ── Email helper ─────────────────────────────────────────────────────────
+
+func sendOTPEmail(to, code string) error {
+	smtpHost := ""
+	if baseConf != nil {
+		smtpHost = baseConf.SMTPHost
+	}
+	// Treat unsubstituted envsubst placeholders as unconfigured.
+	if smtpHost == "" || hasEnvPlaceholder(smtpHost) {
+		// SMTP not configured — succeed silently so local dev can complete
+		// registration without an email server. The OTP code is printed at
+		// Info level so it is visible in default log configurations.
+		log.Info("OTP CODE for %s: %s (SMTP not configured, printed for local dev)", to, code)
+		return nil
+	}
+
+	// Validate the recipient up front: this keeps the To: header and the
+	// SMTP envelope recipient in lockstep, and turns a bad/injected address
+	// into a clear error instead of an opaque net/smtp failure deep in the
+	// stdlib. `to` is caller-controlled (UserData["email"] / UserId).
+	toAddr, err := mail.ParseAddress(to)
+	if err != nil {
+		return fmt.Errorf("invalid recipient address %q: %w", to, err)
+	}
+
+	subject := baseConf.SMTPSubject
+	// Treat an unsubstituted envsubst placeholder as unset.
+	if subject == "" || hasEnvPlaceholder(subject) {
+		subject = "Your OpenNHP Verification Code"
+	}
+	// Include the code in the subject too, so it's visible from the inbox
+	// preview without opening the message. Opt out via smtp_code_in_subject
+	// = false (default true) to keep it out of the least-protected header.
+	codeInSubject := baseConf.SMTPCodeInSubject == nil || *baseConf.SMTPCodeInSubject
+	if codeInSubject {
+		// Trim a trailing ": " so an operator subject like "Your code:"
+		// doesn't render as "Your code:: 186617".
+		subject = fmt.Sprintf("%s: %s", strings.TrimRight(subject, ": "), code)
+	}
+
+	fromRaw := baseConf.SMTPFrom
+	if fromRaw == "" || hasEnvPlaceholder(fromRaw) {
+		fromRaw = "noreply@opennhp.org"
+	}
+	// Parse once: the header keeps the full form (display name allowed),
+	// while the envelope MAIL FROM uses the bare address — most servers
+	// reject the "Name <addr>" form as an envelope argument with a 501.
+	fromAddr, err := mail.ParseAddress(fromRaw)
+	if err != nil {
+		return fmt.Errorf("invalid smtp_from %q: %w", fromRaw, err)
+	}
+
+	// A message with only Subject/MIME/Content-Type headers scores toward
+	// Junk on many receivers — which is exactly where the subject preview
+	// this change adds would not be seen. Include From/To/Date/Message-ID.
+	// The Message-ID domain must match the From domain, or it trips a
+	// common spam heuristic and defeats the purpose of these headers.
+	domain := "opennhp.org"
+	if at := strings.LastIndex(fromAddr.Address, "@"); at >= 0 && at+1 < len(fromAddr.Address) {
+		domain = fromAddr.Address[at+1:]
+	}
+	now := time.Now()
+	msgID := fmt.Sprintf("<%d.%d@%s>", now.UnixNano(), os.Getpid(), domain)
+
+	// Header field bodies must be US-ASCII — net/smtp submits a plain DATA
+	// command and never negotiates SMTPUTF8/8BITMIME. RFC 2047-encode the
+	// subject (QEncoding, a no-op for pure ASCII) so a non-ASCII subject is
+	// still conformant. Address.String() encodes the display name and
+	// handles CR/LF quoting (mail.ParseAddress already rejects CR/LF); note
+	// a non-ASCII addr-spec would still need SMTPUTF8, which is out of scope.
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", fromAddr.String())
+	fmt.Fprintf(&b, "To: %s\r\n", toAddr.String())
+	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("UTF-8", subject))
+	fmt.Fprintf(&b, "Date: %s\r\n", now.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "Message-ID: %s\r\n", msgID)
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+	b.WriteString("\r\n")
+	fmt.Fprintf(&b, "Your verification code is: %s\r\n", code)
+	b.WriteString("This code will expire in 5 minutes.\r\n")
+	b.WriteString("\r\n")
+	b.WriteString("Learn more about OpenNHP at https://opennhp.org\r\n")
+
+	port, err := strconv.Atoi(baseConf.SMTPPort)
+	if err != nil || port <= 0 {
+		port = 587
+	}
+	addr := fmt.Sprintf("%s:%d", baseConf.SMTPHost, port)
+
+	var auth smtp.Auth
+	if baseConf.SMTPUsername != "" {
+		auth = smtp.PlainAuth("", baseConf.SMTPUsername, baseConf.SMTPPassword, baseConf.SMTPHost)
+	}
+
+	return smtp.SendMail(addr, auth, fromAddr.Address, []string{toAddr.Address}, []byte(b.String()))
+}
+
+// hasEnvPlaceholder reports whether s is *entirely* an un-expanded envsubst
+// variable — "${VAR}" or a bare "$VAR" — which is what envsubst leaves
+// behind when the config was not rendered. It deliberately matches the
+// whole string only, so free-form operator text that merely contains a '$'
+// ("Code $5.00", "ACME $CORP verification") is NOT treated as a placeholder.
+func hasEnvPlaceholder(s string) bool {
+	if !strings.HasPrefix(s, "$") {
+		return false
+	}
+	name := s[1:]
+	if strings.HasPrefix(name, "{") && strings.HasSuffix(name, "}") {
+		name = name[1 : len(name)-1]
+	}
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c != '_' && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func corsMiddleware(ctx *gin.Context) {
+	originResource := ctx.Request.Header.Get("Origin")
+
+	if originResource != "" {
+		// HTTP headers for CORS
+		ctx.Writer.Header().Set("Access-Control-Allow-Origin", originResource) // allow cross-origin resource sharing
+	}
+
+	ctx.Next()
+}
+
+func main() {
+
+}

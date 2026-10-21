@@ -1,0 +1,214 @@
+package core
+
+import (
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/log"
+)
+
+type ConnectionData struct {
+	// atomic data, keep 64bit(8-bytes) alignment for 32-bit system compatibility
+	InitTime           int64 // local connection setup time. immutable after created
+	LastRemoteSendTime int64
+	LastLocalSendTime  int64
+	LastLocalRecvTime  int64
+
+	sync.Mutex
+	sync.WaitGroup
+
+	// channelSendMu serializes channelSendWg.Add with Close's transition to
+	// closed, so Close can wait for every in-flight channel send before it
+	// closes the queues and signals.
+	channelSendMu sync.Mutex
+	channelSendWg sync.WaitGroup
+
+	// common
+	Device           *Device
+	LocalAddr        *net.UDPAddr
+	RemoteAddr       *net.UDPAddr
+	RealRemoteAddr   *net.UDPAddr // set for relay-forwarded connections: the real client address behind the relay
+	CookieStore      *CookieStore
+	TimeoutMs        int
+	SendQueue        chan *Packet
+	RecvQueue        chan *Packet
+	BlockSignal      chan struct{}
+	SetTimeoutSignal chan struct{}
+	StopSignal       chan struct{}
+
+	closed atomic.Bool
+
+	// remote transactions
+	RemoteTransactionMutex sync.Mutex
+	RemoteTransactionMap   map[uint64]*RemoteTransaction
+
+	// stickyRecvMu guards stickyRecvAddr and stickyRecvTime. Recv stickiness
+	// used to live on the peer (keyed by pubkey), but multiple connections can
+	// share one pubkey (e.g. an AC fans out AOL to N nhp-server instances that
+	// share an ECDH keypair). Sticking by pubkey would then bounce between
+	// instances and falsely reject packets. Stickiness belongs to the
+	// connection: source addr must stay stable within MinimalPeerAddressHoldTime.
+	stickyRecvMu   sync.Mutex
+	stickyRecvAddr *net.UDPAddr
+	stickyRecvTime int64
+
+	// specific
+	RecvThreatCount int32
+}
+
+func (c *ConnectionData) Equal(other *ConnectionData) bool {
+	// use nanosecond timestamp for comparison
+	return c.InitTime == other.InitTime
+	//return c.RemoteAddr.String() == other.RemoteAddr.String()
+}
+
+func (c *ConnectionData) SetTimeout(ms int) {
+	if !c.beginChannelSend() {
+		log.Warning("connection %s is closed, discard timeout update", c.RemoteAddr.String())
+		return
+	}
+	defer c.channelSendWg.Done()
+
+	c.TimeoutMs = ms
+	select {
+	case c.SetTimeoutSignal <- struct{}{}:
+	case <-c.StopSignal:
+		log.Warning("connection %s stopped, discard timeout update", c.RemoteAddr.String())
+	}
+}
+
+func (c *ConnectionData) Close() {
+	c.channelSendMu.Lock()
+	if !c.closed.CompareAndSwap(false, true) {
+		c.channelSendMu.Unlock()
+		return
+	}
+
+	// close all running transactions
+	close(c.StopSignal)
+	c.channelSendMu.Unlock()
+
+	// No sender can start after closed becomes true. Wait for senders that
+	// started before that transition to leave their channel select.
+	c.channelSendWg.Wait()
+
+	// flush connection remaining packet and close connection thread channels
+flush:
+	for {
+		select {
+		case pkt := <-c.SendQueue:
+			c.Device.ReleasePoolPacket(pkt)
+		case pkt := <-c.RecvQueue:
+			c.Device.ReleasePoolPacket(pkt)
+		case <-c.BlockSignal:
+		default:
+			break flush
+		}
+	}
+
+	close(c.SendQueue)
+	close(c.RecvQueue)
+	close(c.BlockSignal)
+	close(c.SetTimeoutSignal)
+
+	c.Wait()
+}
+
+func (c *ConnectionData) IsClosed() bool {
+	return c.closed.Load()
+}
+
+func (c *ConnectionData) beginChannelSend() bool {
+	c.channelSendMu.Lock()
+	defer c.channelSendMu.Unlock()
+	if c.closed.Load() {
+		return false
+	}
+	c.channelSendWg.Add(1)
+	return true
+}
+
+func (c *ConnectionData) ForwardOutboundPacket(pkt *Packet) {
+	if !c.beginChannelSend() {
+		log.Warning("connection %s is closed, discard outbound packet", c.RemoteAddr.String())
+		c.Device.ReleasePoolPacket(pkt)
+		return
+	}
+	defer c.channelSendWg.Done()
+
+	select {
+	case c.SendQueue <- pkt:
+		// fully encrypted packet will be forwarded to higher level entity for physical sending
+		// may block when send queue is full
+	case <-c.StopSignal:
+		// discard pending packets when connection is closed
+		log.Warning("connection %s stopped, discard pending outbound packet", c.RemoteAddr.String())
+		c.Device.ReleasePoolPacket(pkt)
+	}
+}
+
+func (c *ConnectionData) ForwardInboundPacket(pkt *Packet) {
+	if !c.beginChannelSend() {
+		log.Warning("connection %s is closed, discard inbound packet", c.RemoteAddr.String())
+		c.Device.ReleasePoolPacket(pkt)
+		return
+	}
+	defer c.channelSendWg.Done()
+
+	select {
+	case c.RecvQueue <- pkt:
+		// raw packet will be forwarded to connection routine for packet parsing and decrytion
+		// may block when recv queue is full
+	case <-c.StopSignal:
+		// discard pending packets when connection is closed
+		log.Warning("connection %s stopped, discard pending inbound packet", c.RemoteAddr.String())
+		c.Device.ReleasePoolPacket(pkt)
+	}
+}
+
+// CheckRecvAddress enforces source-address stickiness on this connection:
+// within MinimalPeerAddressHoldTime of the last accepted packet, currAddr
+// must match the previously seen source. After the hold time elapses, a new
+// address is accepted.
+func (c *ConnectionData) CheckRecvAddress(currTime int64, currAddr net.Addr) bool {
+	c.stickyRecvMu.Lock()
+	defer c.stickyRecvMu.Unlock()
+
+	if c.stickyRecvAddr == nil {
+		return true
+	}
+	if currTime > c.stickyRecvTime+MinimalPeerAddressHoldTime*int64(time.Second) {
+		return true
+	}
+	return c.stickyRecvAddr.String() == currAddr.String()
+}
+
+// UpdateRecvAddress records the latest accepted source address for this
+// connection. Call only after CheckRecvAddress has approved currAddr.
+func (c *ConnectionData) UpdateRecvAddress(currTime int64, currAddr net.Addr) {
+	udpAddr, ok := currAddr.(*net.UDPAddr)
+	if !ok {
+		return
+	}
+	c.stickyRecvMu.Lock()
+	c.stickyRecvAddr = udpAddr
+	c.stickyRecvTime = currTime
+	c.stickyRecvMu.Unlock()
+}
+
+func (c *ConnectionData) SendBlockSignal() {
+	if !c.beginChannelSend() {
+		log.Warning("connection is closed, discard block signal")
+		return
+	}
+	defer c.channelSendWg.Done()
+
+	select {
+	case c.BlockSignal <- struct{}{}:
+		// trigger connection to close itself immediately and ask higher level entity to record the blocking connection
+	default:
+		log.Warning("old block signal not processed")
+	}
+}
