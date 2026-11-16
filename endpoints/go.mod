@@ -1,17 +1,17 @@
 module github.com/OpenNHP/opennhp/endpoints
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
 	github.com/emmansun/gmsm v0.45.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/gin-contrib/sessions v1.1.2
+	github.com/gin-contrib/sessions v1.1.4
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
-	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/mark3labs/mcp-go v1.3.0
+	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/sigstore/cosign/v2 v2.6.5
 	github.com/spf13/viper v1.21.0
@@ -156,7 +156,7 @@ require (
 	golang.org/x/arch v0.29.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
